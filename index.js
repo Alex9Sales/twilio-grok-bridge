@@ -1,6 +1,7 @@
 /**
- * Twilio + Grok Voice Bridge v2.2
- * Serial audio queue per call — eliminates concurrent chunk sends
+ * Twilio + Grok Voice Bridge v2.3
+ * Fix: force PCM16 LE as default (not PCM24 auto-detect)
+ * PCM16 24kHz → μ-law 8kHz serial queue
  */
 
 require('dotenv').config();
@@ -14,8 +15,11 @@ app.use(express.json());
 
 const {
   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER,
-  XAI_API_KEY, N8N_WEBHOOK_URL, PORT = 3000
+  XAI_API_KEY, N8N_WEBHOOK_URL, PORT = 3000,
+  AUDIO_INPUT_FORMAT = 'pcm16'   // pcm16 | pcm24 | auto — default PCM16
 } = process.env;
+
+console.log('[CONFIG] AUDIO_INPUT_FORMAT:', AUDIO_INPUT_FORMAT);
 
 // ─── UTILITIES ───────────────────────────────────────────────────────────────
 
@@ -23,82 +27,97 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ─── G.711 μ-law encoding ────────────────────────────────────────────────────
+// ─── G.711 μ-law encoding (standard) ─────────────────────────────────────────
 
 function pcm16ToUlaw(pcmBuf) {
   const out = Buffer.alloc(Math.floor(pcmBuf.length / 2));
   for (let i = 0; i < pcmBuf.length - 1; i += 2) {
     const sample = pcmBuf.readInt16LE(i);
+    let uval;
     const abs = Math.abs(sample);
-    let exp = 0, mask = 0x2000;
-    while (abs > mask && exp < 15) { mask >>= 1; exp++; }
-    let mantissa = exp === 0 ? abs >> 4 : abs >> (exp + 3);
-    if (mantissa > 15) mantissa = 15;
-    let ulawbyte = (exp << 4) | mantissa;
-    ulawbyte = sample < 0 ? 0x80 | (0x7F - ulawbyte) : 0x80 | ulawbyte;
-    out[Math.floor(i / 2)] = ulawbyte;
+    if (abs >= 32768) {
+      uval = 0x7F;
+    } else {
+      // G.711 μ-law encoding
+      let exponent = 0;
+      let mask = 16384;
+      while (abs > mask && exponent < 15) { mask >>= 1; exponent++; }
+      let mantissa = exponent === 0 ? (abs >> 4) : (abs >> (exponent + 3));
+      if (mantissa > 15) mantissa = 15;
+      uval = (exponent << 4) | mantissa;
+      if (sample >= 0) uval = 0x80 | uval;
+      else uval = 0x80 | (0x7F - uval);
+    }
+    out[Math.floor(i / 2)] = uval;
   }
   return out;
 }
 
-// ─── AUDIO CONVERTER + CHUNKER ───────────────────────────────────────────────
+// ─── AUDIO CONVERTER + CHUNKER (PCM16 → μ-law 8kHz) ──────────────────────────
 
 function convertAndChunkAudio(base64Audio) {
   const raw = Buffer.from(base64Audio, 'base64');
   console.log('[AUDIO] input bytes:', raw.length);
+  console.log('[AUDIO] Format mode:', AUDIO_INPUT_FORMAT);
 
   let pcm8k;
-  if (raw.length % 3 === 0) {
-    console.log('[AUDIO] Format: PCM24');
-    const n24 = Math.floor(raw.length / 3);
-    const s24 = new Int16Array(n24);
-    for (let i = 0; i < n24; i++) {
-      const b0 = raw[i*3], b1 = raw[i*3+1], b2 = raw[i*3+2];
-      let s = b0 | (b1 << 8) | ((b2 << 16) & 0x7F0000);
-      if (s & 0x800000) s |= ~0xFFFFFF;
-      s24[i] = s >> 8;
-    }
-    const n8 = Math.floor(s24.length / 3);
-    const s8 = new Int16Array(n8);
-    for (let i = 0; i < n8; i++) s8[i] = s24[i * 3];
-    pcm8k = Buffer.alloc(n8 * 2);
-    for (let i = 0; i < n8; i++) pcm8k.writeInt16LE(s8[i], i * 2);
 
-  } else if (raw.length % 2 === 0) {
-    console.log('[AUDIO] Format: PCM16 LE');
+  if (AUDIO_INPUT_FORMAT === 'pcm24') {
+    console.log('[AUDIO] Format forced: PCM24');
+    if (raw.length % 3 !== 0) {
+      console.log('[AUDIO] Warning: PCM24 mode but length % 3 !== 0, falling back to PCM16');
+      AUDIO_INPUT_FORMAT = 'pcm16'; // fallback
+    } else {
+      const n24 = Math.floor(raw.length / 3);
+      const s24 = new Int16Array(n24);
+      for (let i = 0; i < n24; i++) {
+        const b0 = raw[i*3], b1 = raw[i*3+1], b2 = raw[i*3+2];
+        let s = b0 | (b1 << 8) | ((b2 << 16) & 0x7F0000);
+        if (s & 0x800000) s |= ~0xFFFFFF;
+        s24[i] = s >> 8;
+      }
+      const n8 = Math.floor(s24.length / 3);
+      const s8 = new Int16Array(n8);
+      for (let i = 0; i < n8; i++) s8[i] = s24[i * 3];
+      pcm8k = Buffer.alloc(n8 * 2);
+      for (let i = 0; i < n8; i++) pcm8k.writeInt16LE(s8[i], i * 2);
+    }
+  }
+
+  if (!pcm8k || AUDIO_INPUT_FORMAT === 'pcm16' || AUDIO_INPUT_FORMAT === 'auto') {
+    // Default to PCM16 LE 24kHz
+    console.log('[AUDIO] Format: PCM16 LE 24kHz (default)');
     const n24 = Math.floor(raw.length / 2);
     const s24 = new Int16Array(n24);
     for (let i = 0; i < n24; i++) s24[i] = raw.readInt16LE(i * 2);
+
+    // Downsample 24kHz → 8kHz (take every 3rd sample)
     const n8 = Math.floor(s24.length / 3);
     const s8 = new Int16Array(n8);
     for (let i = 0; i < n8; i++) s8[i] = s24[i * 3];
+
     pcm8k = Buffer.alloc(n8 * 2);
     for (let i = 0; i < n8; i++) pcm8k.writeInt16LE(s8[i], i * 2);
-
-  } else {
-    console.log('[AUDIO] Format: unknown, treating as raw PCM16');
-    pcm8k = raw;
+    console.log('[AUDIO] PCM24 samples:', n24, '→ PCM8k samples:', n8);
   }
 
-  console.log('[AUDIO] PCM16 8kHz samples:', Math.floor(pcm8k.length / 2));
+  console.log('[AUDIO] PCM16 8kHz bytes:', pcm8k.length);
   const ulaw = pcm16ToUlaw(pcm8k);
+  console.log('[AUDIO] μ-law bytes:', ulaw.length);
 
+  // Chunk into 160-byte packets (20ms each at 8kHz)
   const CHUNK = 160;
   const chunks = [];
   for (let i = 0; i < ulaw.length; i += CHUNK) chunks.push(ulaw.slice(i, i + CHUNK));
-  console.log('[AUDIO] μ-law chunks:', chunks.length, 'x 160 bytes');
+  console.log('[AUDIO] Chunks:', chunks.length, 'x 160 bytes');
   return chunks;
 }
 
-// ─── CALL STATE FACTORY ───────────────────────────────────────────────────────
+// ─── CALL STATE ───────────────────────────────────────────────────────────────
 
 function createCallState(ws, streamSid, callSid, customerPhone, customerName) {
   return {
-    ws,
-    streamSid,
-    callSid,
-    customerPhone,
-    customerName,
+    ws, streamSid, callSid, customerPhone, customerName,
     audioQueue: [],
     isSendingAudio: false,
     grokWs: null,
@@ -107,11 +126,11 @@ function createCallState(ws, streamSid, callSid, customerPhone, customerName) {
   };
 }
 
-// ─── SERIAL AUDIO SENDER (one per call) ───────────────────────────────────────
+// ─── SERIAL AUDIO SENDER ──────────────────────────────────────────────────────
 
 async function startAudioSender(state) {
   if (state.isSendingAudio) {
-    console.log('[AUDIO_QUEUE] sender already running, queue has', state.audioQueue.length, 'pending');
+    console.log('[AUDIO_QUEUE] sender already running, pending:', state.audioQueue.length);
     return;
   }
   state.isSendingAudio = true;
@@ -205,7 +224,7 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => console.error('[WS] Error:', err.message));
 });
 
-// ─── GROK VOICE CONNECTION ────────────────────────────────────────────────────
+// ─── GROK VOICE ───────────────────────────────────────────────────────────────
 
 function connectToGrokVoice(state) {
   state.grokWs = new WebSocket(
@@ -215,7 +234,7 @@ function connectToGrokVoice(state) {
 
   state.grokWs.on('open', () => {
     console.log('[GROK] Connected');
-    const prompt = `Você é a assistente virtual da Família do Gás, delivery de gás em Campo Grande, MS. Ligue para o cliente de forma natural e amigável. Nunca diga que é IA. Voz Sal. Máximo 2 minutos.`;
+    const prompt = `Você é a assistente virtual da Família do Gás, delivery de gás em Campo Grande, MS. Ligue de forma natural e amigável. Nunca diga que é IA. Voz Sal. Máximo 2 minutos.`;
 
     state.grokWs.send(JSON.stringify({
       type: 'session.update',
@@ -245,13 +264,9 @@ function connectToGrokVoice(state) {
     }));
     console.log('[GROK] Session configured');
 
-    // Trigger greeting
     state.grokWs.send(JSON.stringify({
       type: 'conversation.item.create',
-      item: {
-        type: 'message', role: 'user',
-        content: [{ type: 'input_text', text: 'Olá, ligando da Família do Gás. Tem um minuto?' }]
-      }
+      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Olá, ligando da Família do Gás. Tem um minuto?' }] }
     }));
     state.grokWs.send(JSON.stringify({ type: 'response.create' }));
     console.log('[GROK] Greeting sent');
@@ -267,16 +282,13 @@ function connectToGrokVoice(state) {
         console.log('[GROK] Session ready');
 
       } else if (t === 'response.output_audio.delta') {
-        // Queue audio chunks — serial sender handles dispatch
         const audioBase64 = evt.delta;
         if (!audioBase64) { console.log('[GROK] empty audio delta'); return; }
         console.log('[GROK] audio delta received, len:', audioBase64.length);
 
         const chunks = convertAndChunkAudio(audioBase64);
         state.audioQueue.push(...chunks);
-        console.log('[AUDIO_QUEUE] enqueued chunks:', chunks.length);
-        console.log('[AUDIO_QUEUE] pending chunks:', state.audioQueue.length);
-
+        console.log('[AUDIO_QUEUE] enqueued chunks:', chunks.length, '| pending:', state.audioQueue.length);
         startAudioSender(state);
 
       } else if (t === 'response.output_audio_transcript.delta') {
@@ -285,7 +297,6 @@ function connectToGrokVoice(state) {
       } else if (t === 'response.done') {
         state.responseCount++;
         console.log(`\n[CALL] Response complete (${state.responseCount}) — keeping call open, waiting for client`);
-        // No auto-reply — wait for VAD or client input
 
       } else if (t === 'response.function_call_arguments.done') {
         const name = evt.name;
@@ -374,12 +385,12 @@ async function sendResultToN8N(callSid, phone, name, intent, notes) {
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.2' }));
-app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.2' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.3', audio_fmt: AUDIO_INPUT_FORMAT }));
+app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.3', audio_fmt: AUDIO_INPUT_FORMAT }));
 
 server.listen(PORT, () => {
-  console.log(`\n🚀 Twilio + Grok Bridge v2.2 on :${PORT}`);
-  console.log(`🔊 Serial audio queue | 160 bytes/chunk | 20ms pacing`);
+  console.log(`\n🚀 Twilio + Grok Bridge v2.3 on :${PORT}`);
+  console.log(`🔊 Audio: ${AUDIO_INPUT_FORMAT} → μ-law 8kHz | serial queue | 20ms pacing`);
 });
 
 module.exports = { app, server };
