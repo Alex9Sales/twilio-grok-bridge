@@ -1,7 +1,7 @@
 /**
- * Twilio + Grok Voice Bridge v2.3
- * Fix: force PCM16 LE as default (not PCM24 auto-detect)
- * PCM16 24kHz → μ-law 8kHz serial queue
+ * Twilio + Grok Voice Bridge v2.4
+ * Fix: configurable AUDIO_SOURCE_RATE (16k/24k/8k)
+ * PCM16 @ 16kHz or 24kHz → μ-law 8kHz serial queue
  */
 
 require('dotenv').config();
@@ -16,10 +16,16 @@ app.use(express.json());
 const {
   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER,
   XAI_API_KEY, N8N_WEBHOOK_URL, PORT = 3000,
-  AUDIO_INPUT_FORMAT = 'pcm16'   // pcm16 | pcm24 | auto — default PCM16
+  AUDIO_INPUT_FORMAT = 'pcm16',
+  AUDIO_SOURCE_RATE = 16000   // 16000 | 24000 | 8000
 } = process.env;
 
+const sourceRate = parseInt(AUDIO_SOURCE_RATE, 10) || 16000;
+const downsampleFactor = sourceRate >= 24000 ? 3 : (sourceRate >= 16000 ? 2 : 1);
+
 console.log('[CONFIG] AUDIO_INPUT_FORMAT:', AUDIO_INPUT_FORMAT);
+console.log('[CONFIG] AUDIO_SOURCE_RATE:', sourceRate, 'Hz');
+console.log('[CONFIG] Downsample factor:', downsampleFactor, '(→ 8kHz)');
 
 // ─── UTILITIES ───────────────────────────────────────────────────────────────
 
@@ -27,85 +33,64 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ─── G.711 μ-law encoding (standard) ─────────────────────────────────────────
+// ─── G.711 μ-law encoding (standard G.711 section 2.2) ───────────────────────
+
+const CLIP = 32635;
+const BIAS = 33;
 
 function pcm16ToUlaw(pcmBuf) {
   const out = Buffer.alloc(Math.floor(pcmBuf.length / 2));
   for (let i = 0; i < pcmBuf.length - 1; i += 2) {
-    const sample = pcmBuf.readInt16LE(i);
-    let uval;
-    const abs = Math.abs(sample);
-    if (abs >= 32768) {
-      uval = 0x7F;
-    } else {
-      // G.711 μ-law encoding
-      let exponent = 0;
-      let mask = 16384;
-      while (abs > mask && exponent < 15) { mask >>= 1; exponent++; }
-      let mantissa = exponent === 0 ? (abs >> 4) : (abs >> (exponent + 3));
-      if (mantissa > 15) mantissa = 15;
-      uval = (exponent << 4) | mantissa;
-      if (sample >= 0) uval = 0x80 | uval;
-      else uval = 0x80 | (0x7F - uval);
-    }
-    out[Math.floor(i / 2)] = uval;
+    let sample = pcmBuf.readInt16LE(i);
+    let sign = 0;
+    if (sample < 0) { sign = 1; sample = -sample; }
+    sample += BIAS;
+    if (sample > CLIP) sample = CLIP;
+    let exponent = 0;
+    let mask = 16384;
+    while (sample > mask && exponent <= 14) { mask >>= 1; exponent++; }
+    let mantissa = (sample >> (exponent === 0 ? 4 : exponent + 3)) & 0x0F;
+    let ulawbyte = (exponent << 4) | mantissa;
+    ulawbyte = sign === 1 ? 0x80 | (0x7F - ulawbyte) : 0x80 | ulawbyte;
+    out[Math.floor(i / 2)] = ulawbyte;
   }
   return out;
 }
 
-// ─── AUDIO CONVERTER + CHUNKER (PCM16 → μ-law 8kHz) ──────────────────────────
+// ─── AUDIO CONVERTER + CHUNKER ────────────────────────────────────────────────
 
 function convertAndChunkAudio(base64Audio) {
   const raw = Buffer.from(base64Audio, 'base64');
   console.log('[AUDIO] input bytes:', raw.length);
+
+  // PCM16 input
   console.log('[AUDIO] Format mode:', AUDIO_INPUT_FORMAT);
+  console.log('[AUDIO] Source rate:', sourceRate, 'Hz');
+  console.log('[AUDIO] Downsample factor:', downsampleFactor);
 
-  let pcm8k;
+  const numInputSamples = Math.floor(raw.length / 2);
+  console.log('[AUDIO] PCM input samples:', numInputSamples);
 
-  if (AUDIO_INPUT_FORMAT === 'pcm24') {
-    console.log('[AUDIO] Format forced: PCM24');
-    if (raw.length % 3 !== 0) {
-      console.log('[AUDIO] Warning: PCM24 mode but length % 3 !== 0, falling back to PCM16');
-      AUDIO_INPUT_FORMAT = 'pcm16'; // fallback
-    } else {
-      const n24 = Math.floor(raw.length / 3);
-      const s24 = new Int16Array(n24);
-      for (let i = 0; i < n24; i++) {
-        const b0 = raw[i*3], b1 = raw[i*3+1], b2 = raw[i*3+2];
-        let s = b0 | (b1 << 8) | ((b2 << 16) & 0x7F0000);
-        if (s & 0x800000) s |= ~0xFFFFFF;
-        s24[i] = s >> 8;
-      }
-      const n8 = Math.floor(s24.length / 3);
-      const s8 = new Int16Array(n8);
-      for (let i = 0; i < n8; i++) s8[i] = s24[i * 3];
-      pcm8k = Buffer.alloc(n8 * 2);
-      for (let i = 0; i < n8; i++) pcm8k.writeInt16LE(s8[i], i * 2);
-    }
-  }
+  // Read PCM16 LE samples
+  const samples = new Int16Array(numInputSamples);
+  for (let i = 0; i < numInputSamples; i++) samples[i] = raw.readInt16LE(i * 2);
 
-  if (!pcm8k || AUDIO_INPUT_FORMAT === 'pcm16' || AUDIO_INPUT_FORMAT === 'auto') {
-    // Default to PCM16 LE 24kHz
-    console.log('[AUDIO] Format: PCM16 LE 24kHz (default)');
-    const n24 = Math.floor(raw.length / 2);
-    const s24 = new Int16Array(n24);
-    for (let i = 0; i < n24; i++) s24[i] = raw.readInt16LE(i * 2);
+  // Downsample to 8kHz
+  const numOutputSamples = Math.floor(samples.length / downsampleFactor);
+  const outSamples = new Int16Array(numOutputSamples);
+  for (let i = 0; i < numOutputSamples; i++) outSamples[i] = samples[i * downsampleFactor];
 
-    // Downsample 24kHz → 8kHz (take every 3rd sample)
-    const n8 = Math.floor(s24.length / 3);
-    const s8 = new Int16Array(n8);
-    for (let i = 0; i < n8; i++) s8[i] = s24[i * 3];
+  console.log('[AUDIO] PCM8k samples:', numOutputSamples);
 
-    pcm8k = Buffer.alloc(n8 * 2);
-    for (let i = 0; i < n8; i++) pcm8k.writeInt16LE(s8[i], i * 2);
-    console.log('[AUDIO] PCM24 samples:', n24, '→ PCM8k samples:', n8);
-  }
+  // Build PCM16 8kHz buffer
+  const pcm8k = Buffer.alloc(numOutputSamples * 2);
+  for (let i = 0; i < numOutputSamples; i++) pcm8k.writeInt16LE(outSamples[i], i * 2);
 
-  console.log('[AUDIO] PCM16 8kHz bytes:', pcm8k.length);
+  // Encode to μ-law
   const ulaw = pcm16ToUlaw(pcm8k);
   console.log('[AUDIO] μ-law bytes:', ulaw.length);
 
-  // Chunk into 160-byte packets (20ms each at 8kHz)
+  // Chunk into 160-byte packets (20ms @ 8kHz = 160 samples = 160 bytes μ-law)
   const CHUNK = 160;
   const chunks = [];
   for (let i = 0; i < ulaw.length; i += CHUNK) chunks.push(ulaw.slice(i, i + CHUNK));
@@ -385,12 +370,13 @@ async function sendResultToN8N(callSid, phone, name, intent, notes) {
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.3', audio_fmt: AUDIO_INPUT_FORMAT }));
-app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.3', audio_fmt: AUDIO_INPUT_FORMAT }));
+app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.4', audio_fmt: AUDIO_INPUT_FORMAT, source_rate: sourceRate }));
+app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.4' }));
 
 server.listen(PORT, () => {
-  console.log(`\n🚀 Twilio + Grok Bridge v2.3 on :${PORT}`);
-  console.log(`🔊 Audio: ${AUDIO_INPUT_FORMAT} → μ-law 8kHz | serial queue | 20ms pacing`);
+  console.log(`\n🚀 Twilio + Grok Bridge v2.4 on :${PORT}`);
+  console.log(`🔊 Audio: pcm16 @ ${sourceRate}Hz → μ-law 8kHz | serial queue | 20ms pacing`);
+  console.log(`📐 Downsample: ${downsampleFactor}:1`);
 });
 
 module.exports = { app, server };
