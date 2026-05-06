@@ -27,17 +27,22 @@ let activeCallSessions = new Map();
 // ─── TWILIO WEBHOOK (inbound call handler) ─────────────────────────────────────
 
 app.post('/voice', (req, res) => {
-  const twiml = new VoiceResponse();
-  twiml.start({
-    action: '/voice/call-status',
-    method: 'POST'
-  }).stream({
-    name: 'grok-voice-stream',
-    url: `wss://${req.headers.host}/grok-media-stream`
-  });
+  console.log('[TWILIO] POST /voice — incoming call');
+  console.log('[TWILIO] CallSid:', req.body?.CallSid);
+  console.log('[TWILIO] From:', req.body?.From);
+  console.log('[TWILIO] To:', req.body?.To);
 
-  console.log('[TWILIO] inbound call received, sending TwiML with media stream');
-  res.type('text/xml').send(twiml.toString());
+  // Use <Connect><Stream> para agentes de voz em tempo real com WebSocket bidirecional
+  // Não usar <Start><Stream> — é o protocolo antigo
+  const twiML = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://twilio.salestecnologia.com.br/grok-media-stream"/>
+  </Connect>
+</Response>`;
+
+  console.log('[TWILIO] Sending TwiML with Connect+Stream');
+  res.type('text/xml').send(twiML);
 });
 
 app.post('/voice/call-status', (req, res) => {
@@ -56,36 +61,63 @@ wss.on('connection', (ws, req) => {
   let grokWs = null;
   let isGrokSessionReady = false;
 
+  console.log('[WS] Twilio media stream connected');
+  console.log('[WS] Waiting for Twilio stream start event...');
+
   ws.on('message', (msg) => {
     try {
       const data = JSON.parse(msg);
-      
-      if (data.event === 'start') {
+      const event = data.event;
+
+      if (event === 'start') {
         callSid = data.start.callSid;
         const customerPhone = data.start.parameters?.From || 'unknown';
         const customerName = data.start.customParameters?.customerName || 'Cliente';
-        
-        console.log(`[CALL] Started: ${callSid} | Customer: ${customerName} (${customerPhone})`);
-        
+
+        console.log(`[CALL] Stream started: ${callSid}`);
+        console.log(`[CALL] From: ${customerPhone}`);
+        console.log(`[CALL] Customer: ${customerName}`);
+        console.log('[CALL] Connecting to Grok Voice API...');
+
         const session = { callSid, customerPhone, customerName, ws, grokWs: null, isGrokSessionReady: false };
         activeCallSessions.set(callSid, session);
         connectToGrokVoice(callSid, customerPhone, customerName);
-        
-      } else if (data.event === 'media') {
+
+      } else if (event === 'media') {
+        // Áudio do Twilio (cliente) → enviar para Grok Voice
+        const audioPayload = data.media.payload;
+        const audioSize = audioPayload ? audioPayload.length : 0;
+
         if (grokWs && grokWs.readyState === WebSocket.OPEN && isGrokSessionReady) {
           grokWs.send(JSON.stringify({
             type: 'input_audio_buffer.append',
-            audio: data.media.payload
+            audio: audioPayload
           }));
+        } else {
+          console.log(`[WS] Grok not ready — buffering audio (${audioSize} bytes)`);
         }
-        
-      } else if (data.event === 'stop') {
-        console.log(`[CALL] Ended: ${callSid}`);
-        if (grokWs) { grokWs.close(); grokWs = null; }
+
+      } else if (event === 'dtmf') {
+        console.log(`[WS] DTMF: ${data.dtmf?.digit || '?'}`);
+
+      } else if (event === 'stop') {
+        console.log(`[CALL] Stream ended: ${callSid}`);
+        console.log(`[CALL] Reason: ${data.stop?.reason || 'unknown'}`);
+        if (grokWs) {
+          console.log('[CALL] Closing Grok connection...');
+          grokWs.close();
+          grokWs = null;
+        }
         activeCallSessions.delete(callSid);
+
+      } else if (event === 'mark') {
+        console.log(`[WS] Mark: ${data.mark?.name || '?'}`);
+
+      } else {
+        console.log(`[WS] Event: ${event}`);
       }
     } catch (e) {
-      console.error('[WS] Error:', e.message);
+      console.error('[WS] Error processing message:', e.message);
     }
   });
 
