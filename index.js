@@ -1,10 +1,6 @@
 /**
- * Twilio + Grok Voice Bridge v2.1
- * Audio streaming bidirecional: Twilio ←→ Grok Voice
- *
- * Grok → Twilio (outbound):
- *   PCM16 LE 24kHz (base64) → downsample 3:1 → PCM16 8kHz → μ-law 8kHz
- *   Envio em chunks de 160 bytes (20ms) com pacing ~20ms entre chunks
+ * Twilio + Grok Voice Bridge v2.2
+ * Serial audio queue per call — eliminates concurrent chunk sends
  */
 
 require('dotenv').config();
@@ -21,31 +17,20 @@ const {
   XAI_API_KEY, N8N_WEBHOOK_URL, PORT = 3000
 } = process.env;
 
-// ─── μ-law encoding (G.711) ──────────────────────────────────────────────────
+// ─── UTILITIES ───────────────────────────────────────────────────────────────
 
-const ULAW_MAP = new Int16Array(256);
-(function buildUlawMap() {
-  const BIAS = 33;
-  for (let i = 0; i < 256; i++) {
-    let val = i ^ 0x55;
-    let sign = (val & 0x80) ? -1 : 1;
-    let exponent = (val >> 4) & 0x07;
-    let mantissa = val & 0x0F;
-    let step = (4 << exponent);
-    let adj = mantissa * step / 16 + step;
-    if (exponent > 0) adj += 4;
-    ULAW_MAP[i] = sign * adj;
-  }
-})();
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ─── G.711 μ-law encoding ────────────────────────────────────────────────────
 
 function pcm16ToUlaw(pcmBuf) {
-  // pcmBuf: Buffer of raw PCM16 LE samples
   const out = Buffer.alloc(Math.floor(pcmBuf.length / 2));
   for (let i = 0; i < pcmBuf.length - 1; i += 2) {
     const sample = pcmBuf.readInt16LE(i);
     const abs = Math.abs(sample);
-    let exp = 0;
-    let mask = 0x2000;
+    let exp = 0, mask = 0x2000;
     while (abs > mask && exp < 15) { mask >>= 1; exp++; }
     let mantissa = exp === 0 ? abs >> 4 : abs >> (exp + 3);
     if (mantissa > 15) mantissa = 15;
@@ -56,73 +41,100 @@ function pcm16ToUlaw(pcmBuf) {
   return out;
 }
 
-// ─── AUDIO CONVERTER (PCM24 → μ-law 8kHz) ────────────────────────────────────
+// ─── AUDIO CONVERTER + CHUNKER ───────────────────────────────────────────────
 
 function convertAndChunkAudio(base64Audio) {
-  // Decode base64 → raw PCM buffer (Grok pode retornar PCM16 LE ou PCM24)
   const raw = Buffer.from(base64Audio, 'base64');
   console.log('[AUDIO] input bytes:', raw.length);
 
-  // Detectar formato: se length % 3 === 0 → possivelmente PCM24 (3 bytes/sample)
-  // se length % 2 === 0 → PCM16 LE (2 bytes/sample)
   let pcm8k;
   if (raw.length % 3 === 0) {
-    console.log('[AUDIO] Detected: PCM24 (3 bytes/sample)');
-    // PCM24 → PCM16 8kHz
-    const numSamples24 = Math.floor(raw.length / 3);
-    const samples24 = new Int16Array(numSamples24);
-    for (let i = 0; i < numSamples24; i++) {
-      // PCM24: 3 bytes little-endian, signed
-      const b0 = raw[i * 3];
-      const b1 = raw[i * 3 + 1];
-      const b2 = raw[i * 3 + 2];
-      let s24 = b0 | (b1 << 8) | ((b2 << 16) & 0xFF0000);
-      if (s24 & 0x800000) s24 |= ~0xFFFFFF;
-      samples24[i] = s24 >> 8; // PCM24 → PCM16 com shift
+    console.log('[AUDIO] Format: PCM24');
+    const n24 = Math.floor(raw.length / 3);
+    const s24 = new Int16Array(n24);
+    for (let i = 0; i < n24; i++) {
+      const b0 = raw[i*3], b1 = raw[i*3+1], b2 = raw[i*3+2];
+      let s = b0 | (b1 << 8) | ((b2 << 16) & 0x7F0000);
+      if (s & 0x800000) s |= ~0xFFFFFF;
+      s24[i] = s >> 8;
     }
-    // Downsample 24kHz → 8kHz (every 3rd)
-    const numSamples8 = Math.floor(samples24.length / 3);
-    const samples8 = new Int16Array(numSamples8);
-    for (let i = 0; i < numSamples8; i++) samples8[i] = samples24[i * 3];
-    // Build PCM16 LE buffer
-    pcm8k = Buffer.alloc(numSamples8 * 2);
-    for (let i = 0; i < numSamples8; i++) pcm8k.writeInt16LE(samples8[i], i * 2);
+    const n8 = Math.floor(s24.length / 3);
+    const s8 = new Int16Array(n8);
+    for (let i = 0; i < n8; i++) s8[i] = s24[i * 3];
+    pcm8k = Buffer.alloc(n8 * 2);
+    for (let i = 0; i < n8; i++) pcm8k.writeInt16LE(s8[i], i * 2);
 
   } else if (raw.length % 2 === 0) {
-    console.log('[AUDIO] Detected: PCM16 LE (2 bytes/sample)');
-    // PCM16 24kHz LE → PCM16 8kHz
-    const numSamples24 = Math.floor(raw.length / 2);
-    const samples24 = new Int16Array(numSamples24);
-    for (let i = 0; i < numSamples24; i++) samples24[i] = raw.readInt16LE(i * 2);
-    // Downsample 24kHz → 8kHz
-    const numSamples8 = Math.floor(samples24.length / 3);
-    const samples8 = new Int16Array(numSamples8);
-    for (let i = 0; i < numSamples8; i++) samples8[i] = samples24[i * 3];
-    // Build PCM16 LE buffer
-    pcm8k = Buffer.alloc(numSamples8 * 2);
-    for (let i = 0; i < numSamples8; i++) pcm8k.writeInt16LE(samples8[i], i * 2);
+    console.log('[AUDIO] Format: PCM16 LE');
+    const n24 = Math.floor(raw.length / 2);
+    const s24 = new Int16Array(n24);
+    for (let i = 0; i < n24; i++) s24[i] = raw.readInt16LE(i * 2);
+    const n8 = Math.floor(s24.length / 3);
+    const s8 = new Int16Array(n8);
+    for (let i = 0; i < n8; i++) s8[i] = s24[i * 3];
+    pcm8k = Buffer.alloc(n8 * 2);
+    for (let i = 0; i < n8; i++) pcm8k.writeInt16LE(s8[i], i * 2);
 
   } else {
-    console.log('[AUDIO] Unknown format, trying PCM16');
-    pcm8k = Buffer.alloc(raw.length);
+    console.log('[AUDIO] Format: unknown, treating as raw PCM16');
     pcm8k = raw;
   }
 
   console.log('[AUDIO] PCM16 8kHz samples:', Math.floor(pcm8k.length / 2));
   const ulaw = pcm16ToUlaw(pcm8k);
-  console.log('[AUDIO] μ-law 8kHz bytes:', ulaw.length);
 
-  // Chunk into 160-byte packets (20ms each at 8kHz)
   const CHUNK = 160;
   const chunks = [];
-  for (let i = 0; i < ulaw.length; i += CHUNK) {
-    chunks.push(ulaw.slice(i, i + CHUNK));
-  }
-  console.log('[AUDIO] Chunks:', chunks.length, 'x 160 bytes');
+  for (let i = 0; i < ulaw.length; i += CHUNK) chunks.push(ulaw.slice(i, i + CHUNK));
+  console.log('[AUDIO] μ-law chunks:', chunks.length, 'x 160 bytes');
   return chunks;
 }
 
-// ─── TWILIO WEBHOOK ────────────────────────────────────────────────────────────
+// ─── CALL STATE FACTORY ───────────────────────────────────────────────────────
+
+function createCallState(ws, streamSid, callSid, customerPhone, customerName) {
+  return {
+    ws,
+    streamSid,
+    callSid,
+    customerPhone,
+    customerName,
+    audioQueue: [],
+    isSendingAudio: false,
+    grokWs: null,
+    isGrokSessionReady: false,
+    responseCount: 0
+  };
+}
+
+// ─── SERIAL AUDIO SENDER (one per call) ───────────────────────────────────────
+
+async function startAudioSender(state) {
+  if (state.isSendingAudio) {
+    console.log('[AUDIO_QUEUE] sender already running, queue has', state.audioQueue.length, 'pending');
+    return;
+  }
+  state.isSendingAudio = true;
+  console.log('[AUDIO_QUEUE] sender started, queue:', state.audioQueue.length);
+
+  while (state.audioQueue.length > 0) {
+    const chunk = state.audioQueue.shift();
+    if (state.ws.readyState === WebSocket.OPEN && state.streamSid) {
+      state.ws.send(JSON.stringify({
+        event: 'media',
+        streamSid: state.streamSid,
+        media: { payload: chunk.toString('base64') }
+      }));
+      console.log('[TWILIO] sent sequential chunk 160 bytes');
+    }
+    await sleep(20);
+  }
+
+  state.isSendingAudio = false;
+  console.log('[AUDIO_QUEUE] drained');
+}
+
+// ─── TWILIO WEBHOOKS ──────────────────────────────────────────────────────────
 
 app.post('/voice', (req, res) => {
   console.log('[TWILIO] POST /voice — CallSid:', req.body?.CallSid, 'From:', req.body?.From);
@@ -146,15 +158,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 wss.on('connection', (ws, req) => {
-  let callSid = null;
-  let streamSid = null;
-  let customerPhone = 'unknown';
-  let customerName = 'Cliente';
-  let grokWs = null;
-  let isGrokSessionReady = false;
-  let responseCount = 0;
-
-  console.log('[WS] Twilio connected');
+  let state = null;
 
   ws.on('message', (msg) => {
     try {
@@ -162,31 +166,29 @@ wss.on('connection', (ws, req) => {
       const event = data.event;
 
       if (event === 'start') {
-        streamSid = data.start?.streamSid;
-        callSid = data.start?.callSid;
-        customerPhone = data.start?.parameters?.From || 'unknown';
-        customerName = data.start?.customParameters?.customerName || 'Cliente';
+        const streamSid = data.start?.streamSid;
+        const callSid = data.start?.callSid;
+        const customerPhone = data.start?.parameters?.From || 'unknown';
+        const customerName = data.start?.customParameters?.customerName || 'Cliente';
+
         console.log('[WS] Stream start — streamSid:', streamSid, '| callSid:', callSid);
         console.log('[WS] Customer:', customerName, customerPhone);
-        console.log('[WS] Connecting to Grok...');
-        connectToGrokVoice();
 
-      } else if (event === 'media') {
-        // Twilio → Grok
+        state = createCallState(ws, streamSid, callSid, customerPhone, customerName);
+        connectToGrokVoice(state);
+
+      } else if (event === 'media' && state) {
         const payload = data.media?.payload;
-        if (payload && grokWs?.readyState === WebSocket.OPEN && isGrokSessionReady) {
-          grokWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
+        if (payload && state.grokWs?.readyState === WebSocket.OPEN && state.isGrokSessionReady) {
+          state.grokWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
         }
 
-      } else if (event === 'mark') {
-        console.log('[WS] Mark:', data.mark?.name);
-
-      } else if (event === 'stop') {
+      } else if (event === 'stop' && state) {
         console.log('[WS] Stream stopped — reason:', data.stop?.reason);
-        if (grokWs) { grokWs.close(); grokWs = null; }
-        isGrokSessionReady = false;
+        if (state.grokWs) { state.grokWs.close(); state.grokWs = null; }
+        state.isGrokSessionReady = false;
 
-      } else if (event === 'dtmf') {
+      } else if (event === 'dtmf' && state) {
         console.log('[WS] DTMF:', data.dtmf?.digit);
       }
     } catch (e) {
@@ -196,146 +198,130 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     console.log('[WS] Twilio disconnected');
-    if (grokWs) { grokWs.close(); grokWs = null; }
-    isGrokSessionReady = false;
+    if (state?.grokWs) { state.grokWs.close(); state.grokWs = null; }
+    if (state) { state.isGrokSessionReady = false; }
   });
 
   ws.on('error', (err) => console.error('[WS] Error:', err.message));
-
-  // ─── Grok Voice Connection ─────────────────────────────────────────────────
-
-  function connectToGrokVoice() {
-    grokWs = new WebSocket(
-      'wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-1.0',
-      { headers: { Authorization: `Bearer ${XAI_API_KEY}` } }
-    );
-
-    grokWs.on('open', () => {
-      console.log('[GROK] Connected');
-      const prompt = `Você é a assistente virtual da Família do Gás, empresa de delivery de gás em Campo Grande, MS. Você está telefonando para um cliente inativo. Haja de forma natural, amigável, como uma pessoa real — nunca diga que é IA. Use a voz Sal, neutra. Máx 2 minutos. Se o cliente não atender, deixe mensagem breve e desligue.`;
-
-      grokWs.send(JSON.stringify({
-        type: 'session.update',
-        session: {
-          voice: 'Sal',
-          instructions: prompt,
-          turn_detection: { type: 'server_vad', threshold: 0.85, silence_duration_ms: 500 },
-          tools: [{
-            type: 'function',
-            name: 'register_result',
-            description: 'Registra resultado da chamada',
-            parameters: {
-              type: 'object',
-              properties: {
-                intent: { type: 'string', enum: ['venda', 'interesse', 'agendar', 'sem_interesse', 'sem_resposta'] },
-                notes: { type: 'string' }
-              },
-              required: ['intent']
-            }
-          }],
-          input_audio_transcription: { model: 'grok-2-audio' },
-          audio: {
-            input: { format: { type: 'audio/pcm', rate: 24000 } },
-            output: { format: { type: 'audio/pcm', rate: 24000 } }
-          }
-        }
-      }));
-      console.log('[GROK] Session configured (Sal, PCM24 output)');
-
-      // Trigger greeting
-      grokWs.send(JSON.stringify({
-        type: 'conversation.item.create',
-        item: {
-          type: 'message', role: 'user',
-          content: [{ type: 'input_text', text: 'Olá, estou ligando da Família do Gás. Tem um minuto?' }]
-        }
-      }));
-      grokWs.send(JSON.stringify({ type: 'response.create' }));
-      console.log('[GROK] Greeting sent');
-    });
-
-    grokWs.on('message', (msg) => {
-      try {
-        const evt = JSON.parse(msg);
-        const t = evt.type || '';
-
-        if (t === 'session.updated') {
-          isGrokSessionReady = true;
-          console.log('[GROK] Session ready');
-
-        } else if (t === 'response.output_audio.delta') {
-          // Áudio Grok → converter e enviar para Twilio com pacing
-          const audioBase64 = evt.delta;
-          if (!audioBase64) { console.log('[GROK] empty audio delta'); return; }
-          console.log('[GROK] audio delta received, len:', audioBase64.length);
-
-          const chunks = convertAndChunkAudio(audioBase64);
-          console.log('[TWILIO] sending', chunks.length, 'chunks, 160 bytes each, 20ms pacing');
-
-          // Send chunks with ~20ms delay between each
-          let chunkIndex = 0;
-          const sendNext = () => {
-            if (chunkIndex >= chunks.length) {
-              console.log('[TWILIO] all chunks sent');
-              return;
-            }
-            if (ws.readyState === WebSocket.OPEN && streamSid) {
-              ws.send(JSON.stringify({
-                event: 'media',
-                streamSid: streamSid,
-                media: { payload: chunks[chunkIndex].toString('base64') }
-              }));
-              console.log(`[TWILIO] chunk ${chunkIndex + 1}/${chunks.length} sent, ${chunks[chunkIndex].length} bytes`);
-            }
-            chunkIndex++;
-            setTimeout(sendNext, 20);
-          };
-          sendNext();
-
-        } else if (t === 'response.output_audio_transcript.delta') {
-          process.stdout.write(evt.delta);
-
-        } else if (t === 'response.done') {
-          responseCount++;
-          console.log(`\n[CALL] Response complete (${responseCount}) — keeping call open, waiting for client`);
-          // Don't auto-reply — just wait for VAD or client input
-
-        } else if (t === 'response.function_call_arguments.done') {
-          const name = evt.name;
-          const args = JSON.parse(evt.arguments || '{}');
-          console.log(`[TOOL] ${name}:`, args);
-          if (name === 'register_result') {
-            sendResultToN8N(callSid, customerPhone, customerName, args.intent, args.notes || '');
-          }
-          grokWs.send(JSON.stringify({
-            type: 'conversation.item.create',
-            item: { type: 'function_call_output', call_id: evt.call_id, output: JSON.stringify({ success: true }) }
-          }));
-          grokWs.send(JSON.stringify({ type: 'response.create' }));
-
-        } else if (t === 'input_audio_buffer.speech_started') {
-          console.log('[GROK] VAD triggered — client speaking, cancelling AI');
-          if (grokWs?.readyState === WebSocket.OPEN) grokWs.send(JSON.stringify({ type: 'response.cancel' }));
-
-        } else if (t === 'conversation.item.input_audio_transcription.completed') {
-          console.log('[GROK] Client said:', evt.transcript);
-
-        } else if (t === 'error') {
-          console.error('[GROK] Error:', evt.error?.message);
-        }
-      } catch (e) {
-        console.error('[GROK] Parse error:', e.message);
-      }
-    });
-
-    grokWs.on('close', () => {
-      console.log('[GROK] Closed');
-      isGrokSessionReady = false;
-    });
-
-    grokWs.on('error', (err) => console.error('[GROK] Error:', err.message));
-  }
 });
+
+// ─── GROK VOICE CONNECTION ────────────────────────────────────────────────────
+
+function connectToGrokVoice(state) {
+  state.grokWs = new WebSocket(
+    'wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-1.0',
+    { headers: { Authorization: `Bearer ${XAI_API_KEY}` } }
+  );
+
+  state.grokWs.on('open', () => {
+    console.log('[GROK] Connected');
+    const prompt = `Você é a assistente virtual da Família do Gás, delivery de gás em Campo Grande, MS. Ligue para o cliente de forma natural e amigável. Nunca diga que é IA. Voz Sal. Máximo 2 minutos.`;
+
+    state.grokWs.send(JSON.stringify({
+      type: 'session.update',
+      session: {
+        voice: 'Sal',
+        instructions: prompt,
+        turn_detection: { type: 'server_vad', threshold: 0.85, silence_duration_ms: 500 },
+        tools: [{
+          type: 'function',
+          name: 'register_result',
+          description: 'Registra resultado da chamada',
+          parameters: {
+            type: 'object',
+            properties: {
+              intent: { type: 'string', enum: ['venda', 'interesse', 'agendar', 'sem_interesse', 'sem_resposta'] },
+              notes: { type: 'string' }
+            },
+            required: ['intent']
+          }
+        }],
+        input_audio_transcription: { model: 'grok-2-audio' },
+        audio: {
+          input: { format: { type: 'audio/pcm', rate: 24000 } },
+          output: { format: { type: 'audio/pcm', rate: 24000 } }
+        }
+      }
+    }));
+    console.log('[GROK] Session configured');
+
+    // Trigger greeting
+    state.grokWs.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message', role: 'user',
+        content: [{ type: 'input_text', text: 'Olá, ligando da Família do Gás. Tem um minuto?' }]
+      }
+    }));
+    state.grokWs.send(JSON.stringify({ type: 'response.create' }));
+    console.log('[GROK] Greeting sent');
+  });
+
+  state.grokWs.on('message', (msg) => {
+    try {
+      const evt = JSON.parse(msg);
+      const t = evt.type || '';
+
+      if (t === 'session.updated') {
+        state.isGrokSessionReady = true;
+        console.log('[GROK] Session ready');
+
+      } else if (t === 'response.output_audio.delta') {
+        // Queue audio chunks — serial sender handles dispatch
+        const audioBase64 = evt.delta;
+        if (!audioBase64) { console.log('[GROK] empty audio delta'); return; }
+        console.log('[GROK] audio delta received, len:', audioBase64.length);
+
+        const chunks = convertAndChunkAudio(audioBase64);
+        state.audioQueue.push(...chunks);
+        console.log('[AUDIO_QUEUE] enqueued chunks:', chunks.length);
+        console.log('[AUDIO_QUEUE] pending chunks:', state.audioQueue.length);
+
+        startAudioSender(state);
+
+      } else if (t === 'response.output_audio_transcript.delta') {
+        process.stdout.write(evt.delta);
+
+      } else if (t === 'response.done') {
+        state.responseCount++;
+        console.log(`\n[CALL] Response complete (${state.responseCount}) — keeping call open, waiting for client`);
+        // No auto-reply — wait for VAD or client input
+
+      } else if (t === 'response.function_call_arguments.done') {
+        const name = evt.name;
+        const args = JSON.parse(evt.arguments || '{}');
+        console.log(`[TOOL] ${name}:`, args);
+        if (name === 'register_result') {
+          sendResultToN8N(state.callSid, state.customerPhone, state.customerName, args.intent, args.notes || '');
+        }
+        state.grokWs.send(JSON.stringify({
+          type: 'conversation.item.create',
+          item: { type: 'function_call_output', call_id: evt.call_id, output: JSON.stringify({ success: true }) }
+        }));
+        state.grokWs.send(JSON.stringify({ type: 'response.create' }));
+
+      } else if (t === 'input_audio_buffer.speech_started') {
+        console.log('[GROK] VAD — client speaking, cancelling AI');
+        if (state.grokWs?.readyState === WebSocket.OPEN) state.grokWs.send(JSON.stringify({ type: 'response.cancel' }));
+
+      } else if (t === 'conversation.item.input_audio_transcription.completed') {
+        console.log('[GROK] Client said:', evt.transcript);
+
+      } else if (t === 'error') {
+        console.error('[GROK] Error:', evt.error?.message);
+      }
+    } catch (e) {
+      console.error('[GROK] Parse error:', e.message);
+    }
+  });
+
+  state.grokWs.on('close', () => {
+    console.log('[GROK] Closed');
+    state.isGrokSessionReady = false;
+  });
+
+  state.grokWs.on('error', (err) => console.error('[GROK] Error:', err.message));
+}
 
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/grok-media-stream') {
@@ -388,12 +374,12 @@ async function sendResultToN8N(callSid, phone, name, intent, notes) {
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.1' }));
-app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.1' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.2' }));
+app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.2' }));
 
 server.listen(PORT, () => {
-  console.log(`\n🚀 Twilio + Grok Bridge v2.1 on :${PORT}`);
-  console.log(`🔊 Audio: PCM24/PCM16 → μ-law 8kHz | chunks: 160bytes/20ms pacing`);
+  console.log(`\n🚀 Twilio + Grok Bridge v2.2 on :${PORT}`);
+  console.log(`🔊 Serial audio queue | 160 bytes/chunk | 20ms pacing`);
 });
 
 module.exports = { app, server };
