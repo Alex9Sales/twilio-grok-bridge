@@ -1,7 +1,6 @@
 /**
- * Twilio + Grok Voice Bridge v2.4
- * Fix: configurable AUDIO_SOURCE_RATE (16k/24k/8k)
- * PCM16 @ 16kHz or 24kHz → μ-law 8kHz serial queue
+ * Twilio + Grok Voice Bridge v2.5
+ * Fix: standard G.711 μ-law encoder, proper call end handling, test endpoint
  */
 
 require('dotenv').config();
@@ -17,7 +16,7 @@ const {
   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER,
   XAI_API_KEY, N8N_WEBHOOK_URL, PORT = 3000,
   AUDIO_INPUT_FORMAT = 'pcm16',
-  AUDIO_SOURCE_RATE = 16000   // 16000 | 24000 | 8000
+  AUDIO_SOURCE_RATE = 16000
 } = process.env;
 
 const sourceRate = parseInt(AUDIO_SOURCE_RATE, 10) || 16000;
@@ -26,6 +25,7 @@ const downsampleFactor = sourceRate >= 24000 ? 3 : (sourceRate >= 16000 ? 2 : 1)
 console.log('[CONFIG] AUDIO_INPUT_FORMAT:', AUDIO_INPUT_FORMAT);
 console.log('[CONFIG] AUDIO_SOURCE_RATE:', sourceRate, 'Hz');
 console.log('[CONFIG] Downsample factor:', downsampleFactor, '(→ 8kHz)');
+console.log('[AUDIO] using standard G.711 μ-law encoder');
 
 // ─── UTILITIES ───────────────────────────────────────────────────────────────
 
@@ -33,26 +33,33 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ─── G.711 μ-law encoding (standard G.711 section 2.2) ───────────────────────
+// ─── STANDARD G.711 μ-law encoder ───────────────────────────────────────────
 
+const BIAS = 0x84;
 const CLIP = 32635;
-const BIAS = 33;
+
+function linearToMulawSample(sample) {
+  let sign = 0;
+  if ((sample >> 8) & 0x80) sign = 0x80;
+  if (sign !== 0) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+
+  sample = sample + BIAS;
+
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+
+  const mantissa = (sample >> (exponent + 3)) & 0x0F;
+  const ulawByte = ~(sign | (exponent << 4) | mantissa);
+
+  return ulawByte & 0xFF;
+}
 
 function pcm16ToUlaw(pcmBuf) {
   const out = Buffer.alloc(Math.floor(pcmBuf.length / 2));
-  for (let i = 0; i < pcmBuf.length - 1; i += 2) {
-    let sample = pcmBuf.readInt16LE(i);
-    let sign = 0;
-    if (sample < 0) { sign = 1; sample = -sample; }
-    sample += BIAS;
-    if (sample > CLIP) sample = CLIP;
-    let exponent = 0;
-    let mask = 16384;
-    while (sample > mask && exponent <= 14) { mask >>= 1; exponent++; }
-    let mantissa = (sample >> (exponent === 0 ? 4 : exponent + 3)) & 0x0F;
-    let ulawbyte = (exponent << 4) | mantissa;
-    ulawbyte = sign === 1 ? 0x80 | (0x7F - ulawbyte) : 0x80 | ulawbyte;
-    out[Math.floor(i / 2)] = ulawbyte;
+  for (let i = 0; i < out.length; i++) {
+    const sample = pcmBuf.readInt16LE(i * 2);
+    out[i] = linearToMulawSample(sample);
   }
   return out;
 }
@@ -62,8 +69,6 @@ function pcm16ToUlaw(pcmBuf) {
 function convertAndChunkAudio(base64Audio) {
   const raw = Buffer.from(base64Audio, 'base64');
   console.log('[AUDIO] input bytes:', raw.length);
-
-  // PCM16 input
   console.log('[AUDIO] Format mode:', AUDIO_INPUT_FORMAT);
   console.log('[AUDIO] Source rate:', sourceRate, 'Hz');
   console.log('[AUDIO] Downsample factor:', downsampleFactor);
@@ -86,11 +91,11 @@ function convertAndChunkAudio(base64Audio) {
   const pcm8k = Buffer.alloc(numOutputSamples * 2);
   for (let i = 0; i < numOutputSamples; i++) pcm8k.writeInt16LE(outSamples[i], i * 2);
 
-  // Encode to μ-law
+  // Encode to μ-law with standard G.711
   const ulaw = pcm16ToUlaw(pcm8k);
   console.log('[AUDIO] μ-law bytes:', ulaw.length);
 
-  // Chunk into 160-byte packets (20ms @ 8kHz = 160 samples = 160 bytes μ-law)
+  // Chunk into 160-byte packets (20ms @ 8kHz)
   const CHUNK = 160;
   const chunks = [];
   for (let i = 0; i < ulaw.length; i += CHUNK) chunks.push(ulaw.slice(i, i + CHUNK));
@@ -107,7 +112,8 @@ function createCallState(ws, streamSid, callSid, customerPhone, customerName) {
     isSendingAudio: false,
     grokWs: null,
     isGrokSessionReady: false,
-    responseCount: 0
+    responseCount: 0,
+    isCallActive: true
   };
 }
 
@@ -122,15 +128,20 @@ async function startAudioSender(state) {
   console.log('[AUDIO_QUEUE] sender started, queue:', state.audioQueue.length);
 
   while (state.audioQueue.length > 0) {
-    const chunk = state.audioQueue.shift();
-    if (state.ws.readyState === WebSocket.OPEN && state.streamSid) {
-      state.ws.send(JSON.stringify({
-        event: 'media',
-        streamSid: state.streamSid,
-        media: { payload: chunk.toString('base64') }
-      }));
-      console.log('[TWILIO] sent sequential chunk 160 bytes');
+    // Check if call is still active before each send
+    if (!state.isCallActive || state.ws.readyState !== WebSocket.OPEN) {
+      console.log('[AUDIO_QUEUE] stopped because call ended');
+      state.audioQueue = [];
+      break;
     }
+
+    const chunk = state.audioQueue.shift();
+    state.ws.send(JSON.stringify({
+      event: 'media',
+      streamSid: state.streamSid,
+      media: { payload: chunk.toString('base64') }
+    }));
+    console.log('[TWILIO] sent sequential chunk 160 bytes');
     await sleep(20);
   }
 
@@ -156,6 +167,17 @@ app.post('/voice/call-status', (req, res) => {
   res.sendStatus(200);
 });
 
+// ─── TEST ENDPOINT — validate Twilio audio without Grok ───────────────────────
+
+app.post('/voice-say', (req, res) => {
+  console.log('[TWILIO] POST /voice-say — test audio without Grok');
+  const twiML = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="pt-BR" voice="alice">Teste de audio Twilio. Se voce ouvir essa mensagem com clareza, o problema esta na conversao do bridge.</Say>
+</Response>`;
+  res.type('text/xml').send(twiML);
+});
+
 // ─── WEBSOCKET SERVER ─────────────────────────────────────────────────────────
 
 const server = http.createServer(app);
@@ -177,6 +199,7 @@ wss.on('connection', (ws, req) => {
 
         console.log('[WS] Stream start — streamSid:', streamSid, '| callSid:', callSid);
         console.log('[WS] Customer:', customerName, customerPhone);
+        console.log('[WS] Connecting to Grok...');
 
         state = createCallState(ws, streamSid, callSid, customerPhone, customerName);
         connectToGrokVoice(state);
@@ -188,7 +211,10 @@ wss.on('connection', (ws, req) => {
         }
 
       } else if (event === 'stop' && state) {
+        console.log('[WS] stop received, clearing audio queue');
         console.log('[WS] Stream stopped — reason:', data.stop?.reason);
+        state.isCallActive = false;
+        state.audioQueue = [];
         if (state.grokWs) { state.grokWs.close(); state.grokWs = null; }
         state.isGrokSessionReady = false;
 
@@ -202,8 +228,12 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     console.log('[WS] Twilio disconnected');
-    if (state?.grokWs) { state.grokWs.close(); state.grokWs = null; }
-    if (state) { state.isGrokSessionReady = false; }
+    if (state) {
+      state.isCallActive = false;
+      state.audioQueue = [];
+      if (state.grokWs) { state.grokWs.close(); state.grokWs = null; }
+      state.isGrokSessionReady = false;
+    }
   });
 
   ws.on('error', (err) => console.error('[WS] Error:', err.message));
@@ -269,6 +299,7 @@ function connectToGrokVoice(state) {
       } else if (t === 'response.output_audio.delta') {
         const audioBase64 = evt.delta;
         if (!audioBase64) { console.log('[GROK] empty audio delta'); return; }
+        if (!state.isCallActive) { console.log('[GROK] call ended, ignoring audio'); return; }
         console.log('[GROK] audio delta received, len:', audioBase64.length);
 
         const chunks = convertAndChunkAudio(audioBase64);
@@ -346,6 +377,26 @@ app.post('/call', async (req, res) => {
   }
 });
 
+// Test endpoint for outbound call using /voice-say
+app.post('/call-test', async (req, res) => {
+  const { to, customerName } = req.body;
+  if (!to) return res.status(400).json({ error: 'Missing "to"' });
+  try {
+    const client = require('twilio')(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    const call = await client.calls.create({
+      to, from: TWILIO_PHONE_NUMBER,
+      url: `https://${req.headers.host}/voice-say`,
+      statusCallback: `https://${req.headers.host}/voice/call-status`,
+      statusCallbackEvent: ['completed', 'no-answer', 'busy']
+    });
+    console.log(`[OUTBOUND TEST] ${call.sid} → ${to} (Twilio Say test)`);
+    res.json({ success: true, callSid: call.sid, note: 'Testing Twilio TTS without Grok' });
+  } catch (err) {
+    console.error('[OUTBOUND]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/calls', async (req, res) => {
   try {
     const client = require('twilio')(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
@@ -370,13 +421,14 @@ async function sendResultToN8N(callSid, phone, name, intent, notes) {
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.4', audio_fmt: AUDIO_INPUT_FORMAT, source_rate: sourceRate }));
-app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.4' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.5', audio_fmt: AUDIO_INPUT_FORMAT, source_rate: sourceRate }));
+app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.5' }));
 
 server.listen(PORT, () => {
-  console.log(`\n🚀 Twilio + Grok Bridge v2.4 on :${PORT}`);
-  console.log(`🔊 Audio: pcm16 @ ${sourceRate}Hz → μ-law 8kHz | serial queue | 20ms pacing`);
+  console.log(`\n🚀 Twilio + Grok Bridge v2.5 on :${PORT}`);
+  console.log(`🔊 Audio: pcm16 @ ${sourceRate}Hz → std G.711 μ-law 8kHz | serial queue | 20ms pacing`);
   console.log(`📐 Downsample: ${downsampleFactor}:1`);
+  console.log(`🧪 Test: POST /call-test → Twilio TTS (no Grok)`);
 });
 
 module.exports = { app, server };
