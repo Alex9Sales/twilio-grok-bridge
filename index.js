@@ -1,6 +1,6 @@
 /**
- * Twilio + Grok Voice Bridge v2.5
- * Fix: standard G.711 μ-law encoder, proper call end handling, test endpoint
+ * Twilio + Grok Voice Bridge v2.6
+ * Fixes: prebuffer, audio gain, better downsampling, faster VAD, commercial context
  */
 
 require('dotenv').config();
@@ -16,16 +16,21 @@ const {
   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER,
   XAI_API_KEY, N8N_WEBHOOK_URL, PORT = 3000,
   AUDIO_INPUT_FORMAT = 'pcm16',
-  AUDIO_SOURCE_RATE = 16000
+  AUDIO_SOURCE_RATE = 24000,
+  AUDIO_GAIN = 0.85
 } = process.env;
 
-const sourceRate = parseInt(AUDIO_SOURCE_RATE, 10) || 16000;
+const sourceRate = parseInt(AUDIO_SOURCE_RATE, 10) || 24000;
 const downsampleFactor = sourceRate >= 24000 ? 3 : (sourceRate >= 16000 ? 2 : 1);
+const gain = parseFloat(AUDIO_GAIN) || 0.85;
+const PREBUFFER_CHUNKS = 4; // accumulate 4 chunks before starting sender
 
 console.log('[CONFIG] AUDIO_INPUT_FORMAT:', AUDIO_INPUT_FORMAT);
 console.log('[CONFIG] AUDIO_SOURCE_RATE:', sourceRate, 'Hz');
 console.log('[CONFIG] Downsample factor:', downsampleFactor, '(→ 8kHz)');
+console.log('[CONFIG] AUDIO_GAIN:', gain);
 console.log('[AUDIO] using standard G.711 μ-law encoder');
+console.log('[AUDIO] Downsampling: 3-sample averaging');
 
 // ─── UTILITIES ───────────────────────────────────────────────────────────────
 
@@ -39,19 +44,22 @@ const BIAS = 0x84;
 const CLIP = 32635;
 
 function linearToMulawSample(sample) {
-  let sign = 0;
-  if ((sample >> 8) & 0x80) sign = 0x80;
-  if (sign !== 0) sample = -sample;
-  if (sample > CLIP) sample = CLIP;
+  // Apply gain
+  let g = sample * gain;
+  // Clamp
+  if (g > 32767) g = 32767;
+  if (g < -32768) g = -32768;
 
-  sample = sample + BIAS;
+  let sign = (g < 0) ? 0x80 : 0;
+  if (sign !== 0) g = -g;
+  if (g > CLIP) g = CLIP;
+  g = g + BIAS;
 
   let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  for (let expMask = 0x4000; (g & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
 
-  const mantissa = (sample >> (exponent + 3)) & 0x0F;
+  const mantissa = (g >> (exponent + 3)) & 0x0F;
   const ulawByte = ~(sign | (exponent << 4) | mantissa);
-
   return ulawByte & 0xFF;
 }
 
@@ -64,32 +72,42 @@ function pcm16ToUlaw(pcmBuf) {
   return out;
 }
 
+// ─── BETTER DOWNSAMPLING (3-sample averaging) ────────────────────────────────
+
+function downsampleAverage(samples, factor) {
+  const numOut = Math.floor(samples.length / factor);
+  const out = new Int16Array(numOut);
+  for (let i = 0; i < numOut; i++) {
+    const start = i * factor;
+    let sum = 0;
+    for (let j = 0; j < factor; j++) {
+      sum += samples[start + j];
+    }
+    out[i] = Math.round(sum / factor);
+  }
+  return out;
+}
+
 // ─── AUDIO CONVERTER + CHUNKER ────────────────────────────────────────────────
 
 function convertAndChunkAudio(base64Audio) {
   const raw = Buffer.from(base64Audio, 'base64');
-  console.log('[AUDIO] input bytes:', raw.length);
-  console.log('[AUDIO] Format mode:', AUDIO_INPUT_FORMAT);
-  console.log('[AUDIO] Source rate:', sourceRate, 'Hz');
-  console.log('[AUDIO] Downsample factor:', downsampleFactor);
-
   const numInputSamples = Math.floor(raw.length / 2);
+
+  console.log('[AUDIO] input bytes:', raw.length);
   console.log('[AUDIO] PCM input samples:', numInputSamples);
 
   // Read PCM16 LE samples
   const samples = new Int16Array(numInputSamples);
   for (let i = 0; i < numInputSamples; i++) samples[i] = raw.readInt16LE(i * 2);
 
-  // Downsample to 8kHz
-  const numOutputSamples = Math.floor(samples.length / downsampleFactor);
-  const outSamples = new Int16Array(numOutputSamples);
-  for (let i = 0; i < numOutputSamples; i++) outSamples[i] = samples[i * downsampleFactor];
-
-  console.log('[AUDIO] PCM8k samples:', numOutputSamples);
+  // Downsample using 3-sample averaging (reduces noise)
+  const outSamples = downsampleAverage(samples, downsampleFactor);
+  console.log('[AUDIO] PCM8k samples:', outSamples.length);
 
   // Build PCM16 8kHz buffer
-  const pcm8k = Buffer.alloc(numOutputSamples * 2);
-  for (let i = 0; i < numOutputSamples; i++) pcm8k.writeInt16LE(outSamples[i], i * 2);
+  const pcm8k = Buffer.alloc(outSamples.length * 2);
+  for (let i = 0; i < outSamples.length; i++) pcm8k.writeInt16LE(outSamples[i], i * 2);
 
   // Encode to μ-law with standard G.711
   const ulaw = pcm16ToUlaw(pcm8k);
@@ -110,22 +128,53 @@ function createCallState(ws, streamSid, callSid, customerPhone, customerName) {
     ws, streamSid, callSid, customerPhone, customerName,
     audioQueue: [],
     isSendingAudio: false,
+    prebufferCount: 0,
     grokWs: null,
     isGrokSessionReady: false,
     responseCount: 0,
-    isCallActive: true
+    isCallActive: true,
+    timestamps: {}
   };
 }
 
-// ─── SERIAL AUDIO SENDER ──────────────────────────────────────────────────────
+// ─── SERIAL AUDIO SENDER WITH PREBUFFER ──────────────────────────────────────
 
 async function startAudioSender(state) {
   if (state.isSendingAudio) {
     console.log('[AUDIO_QUEUE] sender already running, pending:', state.audioQueue.length);
     return;
   }
+
+  // PREBUFFER: accumulate chunks before sending
+  state.prebufferCount = 0;
+  const waitForPrebuffer = () => {
+    return new Promise(resolve => {
+      const check = () => {
+        state.prebufferCount++;
+        console.log('[AUDIO_QUEUE] prebuffer:', state.prebufferCount, '/', PREBUFFER_CHUNKS, '| queue:', state.audioQueue.length);
+        if (state.prebufferCount >= PREBUFFER_CHUNKS || state.audioQueue.length === 0) {
+          resolve();
+        } else {
+          setTimeout(check, 20);
+        }
+      };
+      check();
+    });
+  };
+
+  console.log('[AUDIO_QUEUE] starting sender with prebuffer (target:', PREBUFFER_CHUNKS, ')');
   state.isSendingAudio = true;
-  console.log('[AUDIO_QUEUE] sender started, queue:', state.audioQueue.length);
+
+  // Wait for prebuffer
+  await waitForPrebuffer();
+
+  if (state.audioQueue.length === 0) {
+    state.isSendingAudio = false;
+    console.log('[AUDIO_QUEUE] prebuffer done but queue empty, aborting');
+    return;
+  }
+
+  console.log('[AUDIO_QUEUE] prebuffer ready:', state.audioQueue.length, 'chunks');
 
   while (state.audioQueue.length > 0) {
     // Check if call is still active before each send
@@ -146,6 +195,7 @@ async function startAudioSender(state) {
   }
 
   state.isSendingAudio = false;
+  state.prebufferCount = 0;
   console.log('[AUDIO_QUEUE] drained');
 }
 
@@ -167,10 +217,10 @@ app.post('/voice/call-status', (req, res) => {
   res.sendStatus(200);
 });
 
-// ─── TEST ENDPOINT — validate Twilio audio without Grok ───────────────────────
+// ─── TEST ENDPOINT ─────────────────────────────────────────────────────────────
 
 app.post('/voice-say', (req, res) => {
-  console.log('[TWILIO] POST /voice-say — test audio without Grok');
+  console.log('[TWILIO] POST /voice-say — test audio');
   const twiML = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="pt-BR" voice="alice">Teste de audio Twilio. Se voce ouvir essa mensagem com clareza, o problema esta na conversao do bridge.</Say>
@@ -185,6 +235,7 @@ const wss = new WebSocket.Server({ noServer: true });
 
 wss.on('connection', (ws, req) => {
   let state = null;
+  const callStartTime = Date.now();
 
   ws.on('message', (msg) => {
     try {
@@ -197,17 +248,23 @@ wss.on('connection', (ws, req) => {
         const customerPhone = data.start?.parameters?.From || 'unknown';
         const customerName = data.start?.customParameters?.customerName || 'Cliente';
 
+        state = createCallState(ws, streamSid, callSid, customerPhone, customerName);
+        state.timestamps.callStartMs = Date.now();
         console.log('[WS] Stream start — streamSid:', streamSid, '| callSid:', callSid);
         console.log('[WS] Customer:', customerName, customerPhone);
-        console.log('[WS] Connecting to Grok...');
+        console.log('[LATENCY] twilio_start_to_grok_ready_ms:', '(measured on grok connect)');
 
-        state = createCallState(ws, streamSid, callSid, customerPhone, customerName);
         connectToGrokVoice(state);
 
       } else if (event === 'media' && state) {
         const payload = data.media?.payload;
+        const recvTime = Date.now();
         if (payload && state.grokWs?.readyState === WebSocket.OPEN && state.isGrokSessionReady) {
           state.grokWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
+          if (state.timestamps.lastUserAudioMs) {
+            console.log('[LATENCY] user_audio_to_response_ms:', recvTime - state.timestamps.lastUserAudioMs);
+          }
+          state.timestamps.lastUserAudioMs = recvTime;
         }
 
       } else if (event === 'stop' && state) {
@@ -242,6 +299,9 @@ wss.on('connection', (ws, req) => {
 // ─── GROK VOICE ───────────────────────────────────────────────────────────────
 
 function connectToGrokVoice(state) {
+  state.timestamps.grokConnectMs = Date.now();
+  console.log('[LATENCY] twilio_start_to_grok_ready_ms:', state.timestamps.grokConnectMs - state.timestamps.callStartMs);
+
   state.grokWs = new WebSocket(
     'wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-1.0',
     { headers: { Authorization: `Bearer ${XAI_API_KEY}` } }
@@ -249,14 +309,50 @@ function connectToGrokVoice(state) {
 
   state.grokWs.on('open', () => {
     console.log('[GROK] Connected');
-    const prompt = `Você é a assistente virtual da Família do Gás, delivery de gás em Campo Grande, MS. Ligue de forma natural e amigável. Nunca diga que é IA. Voz Sal. Máximo 2 minutos.`;
+
+    // Updated persona: direct commercial approach, no "do que se trata?"
+    const agentInstructions = `Você é a assistente virtual da Família do Gás, empresa de delivery de gás em Campo Grande, MS. Você está ligando para clientes que estão inativos há mais de 15 dias.
+
+## REGRAS DE OUVIDO
+- Fale de forma natural, curta e direta
+- Uma pergunta por vez
+- Menos de 12 palavras por frase
+- Nunca diga "do que se trata?" ou "em que posso ajudar?"
+- Nunca pergunte genericamente
+
+## ROTEIRO
+
+### ABERTURA (primeiros 5 segundos):
+"Olá, aqui é da Família do Gás. Tudo bem? Eu estou ligando porque percibemos que faz um tempo do seu último pedido. Você está precisando de gás hoje?"
+
+### SE CLIENTE DIZER "sim", "está tudo bem", "pode ser":
+"Fechou! Só confirmar: é para o endereço habitual, né? Em quanto tempo você precisa?"
+
+### SE CLIENTE DIZER "não", "não preciso":
+"Tudo bem, sem problema. Só para saber, você costuma comprar de qual distribuidores? A gente tem uma promoção especial para clientes antigos."
+
+### SE CLIENTE NÃO ATENDER OU DESVIAR:
+"Se não estiver num bom momento, pode ligar depois neste número: 67 9361-8055. Obrigado!"
+
+### ENCERRAMENTO:
+"Se precisar, é só chamar no WhatsApp: 67 9361-8055. Muito obrigado, bom dia!"
+
+## FERRAMENTA
+register_result(intent, notes):
+- intent: "venda" | "interesse" | "agendar" | "sem_interesse" | "sem_resposta"
+- notes: observaciones`;
 
     state.grokWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         voice: 'Sal',
-        instructions: prompt,
-        turn_detection: { type: 'server_vad', threshold: 0.85, silence_duration_ms: 500 },
+        instructions: agentInstructions,
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,
+          silence_duration_ms: 500,
+          prefix_padding_ms: 200
+        },
         tools: [{
           type: 'function',
           name: 'register_result',
@@ -277,14 +373,20 @@ function connectToGrokVoice(state) {
         }
       }
     }));
-    console.log('[GROK] Session configured');
+    console.log('[GROK] Session configured (faster VAD: threshold=0.5, silence=500ms)');
 
     state.grokWs.send(JSON.stringify({
       type: 'conversation.item.create',
-      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Olá, ligando da Família do Gás. Tem um minuto?' }] }
+      item: {
+        type: 'message', role: 'user',
+        content: [{ type: 'input_text', text: 'Inicie a ligação.' }]
+      }
     }));
     state.grokWs.send(JSON.stringify({ type: 'response.create' }));
     console.log('[GROK] Greeting sent');
+
+    state.timestamps.firstResponseSentMs = Date.now();
+    console.log('[LATENCY] grok_ready_to_first_audio_ms:', state.timestamps.firstResponseSentMs - state.timestamps.grokConnectMs);
   });
 
   state.grokWs.on('message', (msg) => {
@@ -294,18 +396,28 @@ function connectToGrokVoice(state) {
 
       if (t === 'session.updated') {
         state.isGrokSessionReady = true;
-        console.log('[GROK] Session ready');
 
       } else if (t === 'response.output_audio.delta') {
         const audioBase64 = evt.delta;
-        if (!audioBase64) { console.log('[GROK] empty audio delta'); return; }
-        if (!state.isCallActive) { console.log('[GROK] call ended, ignoring audio'); return; }
-        console.log('[GROK] audio delta received, len:', audioBase64.length);
+        if (!audioBase64) return;
+        if (!state.isCallActive) return;
 
+        const firstAudioTime = Date.now();
+        if (state.timestamps.firstAudioMs === undefined) {
+          state.timestamps.firstAudioMs = firstAudioTime;
+          console.log('[LATENCY] grok_ready_to_first_audio_ms:', firstAudioTime - state.timestamps.firstResponseSentMs);
+          console.log('[LATENCY] first_audio_to_first_twilio_chunk_ms: (sending...)');
+        }
+
+        console.log('[GROK] audio delta received, len:', audioBase64.length);
         const chunks = convertAndChunkAudio(audioBase64);
         state.audioQueue.push(...chunks);
         console.log('[AUDIO_QUEUE] enqueued chunks:', chunks.length, '| pending:', state.audioQueue.length);
         startAudioSender(state);
+
+        if (state.timestamps.firstTwilioChunkMs === undefined && chunks.length > 0) {
+          console.log('[LATENCY] first_audio_to_first_twilio_chunk_ms:', Date.now() - state.timestamps.firstAudioMs);
+        }
 
       } else if (t === 'response.output_audio_transcript.delta') {
         process.stdout.write(evt.delta);
@@ -328,7 +440,7 @@ function connectToGrokVoice(state) {
         state.grokWs.send(JSON.stringify({ type: 'response.create' }));
 
       } else if (t === 'input_audio_buffer.speech_started') {
-        console.log('[GROK] VAD — client speaking, cancelling AI');
+        console.log('[GROK] VAD — client speaking');
         if (state.grokWs?.readyState === WebSocket.OPEN) state.grokWs.send(JSON.stringify({ type: 'response.cancel' }));
 
       } else if (t === 'conversation.item.input_audio_transcription.completed') {
@@ -377,7 +489,6 @@ app.post('/call', async (req, res) => {
   }
 });
 
-// Test endpoint for outbound call using /voice-say
 app.post('/call-test', async (req, res) => {
   const { to, customerName } = req.body;
   if (!to) return res.status(400).json({ error: 'Missing "to"' });
@@ -389,8 +500,8 @@ app.post('/call-test', async (req, res) => {
       statusCallback: `https://${req.headers.host}/voice/call-status`,
       statusCallbackEvent: ['completed', 'no-answer', 'busy']
     });
-    console.log(`[OUTBOUND TEST] ${call.sid} → ${to} (Twilio Say test)`);
-    res.json({ success: true, callSid: call.sid, note: 'Testing Twilio TTS without Grok' });
+    console.log(`[OUTBOUND TEST] ${call.sid} → ${to} (Twilio TTS)`);
+    res.json({ success: true, callSid: call.sid, note: 'Testing Twilio TTS' });
   } catch (err) {
     console.error('[OUTBOUND]', err.message);
     res.status(500).json({ error: err.message });
@@ -421,14 +532,14 @@ async function sendResultToN8N(callSid, phone, name, intent, notes) {
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.5', audio_fmt: AUDIO_INPUT_FORMAT, source_rate: sourceRate }));
-app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.5' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', v: '2.6', gain, source_rate: sourceRate }));
+app.get('/', (_, res) => res.json({ name: 'Twilio + Grok Voice Bridge', v: '2.6' }));
 
 server.listen(PORT, () => {
-  console.log(`\n🚀 Twilio + Grok Bridge v2.5 on :${PORT}`);
-  console.log(`🔊 Audio: pcm16 @ ${sourceRate}Hz → std G.711 μ-law 8kHz | serial queue | 20ms pacing`);
-  console.log(`📐 Downsample: ${downsampleFactor}:1`);
-  console.log(`🧪 Test: POST /call-test → Twilio TTS (no Grok)`);
+  console.log(`\n🚀 Twilio + Grok Bridge v2.6 on :${PORT}`);
+  console.log(`🔊 Audio: pcm16 @ ${sourceRate}Hz → std G.711 μ-law 8kHz | gain:${gain} | 3-sample avg downsample`);
+  console.log(`📦 Prebuffer: ${PREBUFFER_CHUNKS} chunks | 20ms pacing`);
+  console.log(`⚡ VAD: threshold=0.5, silence=500ms, padding=200ms`);
 });
 
 module.exports = { app, server };
