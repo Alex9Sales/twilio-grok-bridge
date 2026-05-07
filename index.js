@@ -1,6 +1,6 @@
 /**
- * Twilio + Grok Voice Bridge v2.9
- * Local VAD on Twilio inbound audio for fast barge-in
+ * Twilio + Grok Voice Bridge v2.10
+ * Fix: higher RMS threshold, echo guard, suppress stale deltas, correct silence timer
  */
 
 require('dotenv').config();
@@ -20,8 +20,9 @@ const {
   AUDIO_GAIN = '0.85',
   MAX_QUEUE_SIZE = '300',
   LOCAL_VAD_ENABLED = 'true',
-  BARGE_IN_RMS_THRESHOLD = '20',
-  BARGE_IN_MIN_FRAMES = '3'
+  BARGE_IN_RMS_THRESHOLD = '180',
+  BARGE_IN_MIN_FRAMES = '4',
+  BARGE_IN_ECHO_GUARD_MS = '500'
 } = process.env;
 
 const sourceRate = parseInt(AUDIO_SOURCE_RATE) || 24000;
@@ -30,27 +31,27 @@ const gain = parseFloat(AUDIO_GAIN) || 0.85;
 const MAX_QUEUE = parseInt(MAX_QUEUE_SIZE) || 300;
 const PREBUFFER = 3;
 const SILENCE_TIMEOUT = 5000;
-
 const VAD_ENABLED = LOCAL_VAD_ENABLED === 'true';
-const RMS_THRESH = parseInt(BARGE_IN_RMS_THRESHOLD) || 20;
-const MIN_FRAMES = parseInt(BARGE_IN_MIN_FRAMES) || 3;
+const RMS_THRESH = parseInt(BARGE_IN_RMS_THRESHOLD) || 180;
+const MIN_FRAMES = parseInt(BARGE_IN_MIN_FRAMES) || 4;
+const ECHO_GUARD = parseInt(BARGE_IN_ECHO_GUARD_MS) || 500;
 
 console.log(`[CONFIG] rate:${sourceRate} gain:${gain} maxQ:${MAX_QUEUE}`);
-console.log(`[LOCAL_VAD] enabled:${VAD_ENABLED} rms:${RMS_THRESH} minFrames:${MIN_FRAMES}`);
+console.log(`[LOCAL_VAD] enabled:${VAD_ENABLED} rms:${RMS_THRESH} minFrames:${MIN_FRAMES} echoGuard:${ECHO_GUARD}ms`);
 
 // ─── UTILITIES ───────────────────────────────────────────────────────────────
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── μ-law decode ─────────────────────────────────────────────────────────────
+// ─── μ-law decode (for VAD) ─────────────────────────────────────────────────
 
 function ulawToPcm16(byte) {
   byte = ~byte;
   const sign = byte & 0x80 ? -1 : 1;
-  const exponent = (byte >> 4) & 0x07;
-  const mantissa = byte & 0x0F;
-  const step = (4 << exponent);
-  const adj = exponent === 0 ? (mantissa * step / 16 + step) : (mantissa * step / 16 + step + 4);
+  const e = (byte >> 4) & 0x07;
+  const m = byte & 0x0F;
+  const step = (4 << e);
+  const adj = e === 0 ? (m * step / 16 + step) : (m * step / 16 + step + 4);
   return sign * adj;
 }
 
@@ -63,7 +64,7 @@ function calcRms(ulawBuf) {
   return Math.sqrt(sum / ulawBuf.length);
 }
 
-// ─── G.711 μ-law encode ──────────────────────────────────────────────────────
+// ─── G.711 μ-law encode ─────────────────────────────────────────────────────
 
 const BIAS = 0x84, CLIP = 32635;
 function toUlaw(s) {
@@ -84,7 +85,7 @@ function pcmToUlaw(buf) {
   return out;
 }
 
-// ─── 3-sample downsample ───────────────────────────────────────────────────
+// ─── 3-sample avg downsample ────────────────────────────────────────────────
 
 function downsample(samples, factor) {
   const out = new Int16Array(Math.floor(samples.length / factor));
@@ -96,7 +97,7 @@ function downsample(samples, factor) {
   return out;
 }
 
-// ─── AUDIO CONVERTER ─────────────────────────────────────────────────────────
+// ─── AUDIO CONVERTER ────────────────────────────────────────────────────────
 
 function toChunks(base64) {
   const raw = Buffer.from(base64, 'base64');
@@ -112,7 +113,7 @@ function toChunks(base64) {
   return chunks;
 }
 
-// ─── CALL STATE ─────────────────────────────────────────────────────────────
+// ─── CALL STATE ────────────────────────────────────────────────────────────
 
 function makeState(ws, sid, callSid, phone, name) {
   return {
@@ -125,25 +126,26 @@ function makeState(ws, sid, callSid, phone, name) {
     callActive: true,
     userSpeaking: false,
     aiSpeaking: false,
-    gen: 0,
+    suppressAiAudio: false,
+    playbackGen: 0,
+    responseGen: 0,
     grokRespActive: false,
     silenceTimer: null,
     silenceAttempts: 0,
     // Local VAD
     vadFrameCount: 0,
-    lastRms: 0,
-    timestamps: {}
+    echoGuardUntil: 0, // timestamp until which VAD is suppressed
+    lastRms: 0
   };
 }
 
-// ─── BARGE-IN ─────────────────────────────────────────────────────────────────
+// ─── BARGE-IN ──────────────────────────────────────────────────────────────
 
 function doBargeIn(st) {
-  if (st.userSpeaking) return;
   console.log('[BARGE_IN] user started speaking');
-
   st.userSpeaking = true;
   st.aiSpeaking = false;
+  st.suppressAiAudio = true;
 
   // Clear Twilio
   if (st.ws?.readyState === WebSocket.OPEN && st.sid) {
@@ -152,34 +154,46 @@ function doBargeIn(st) {
   }
 
   st.queue = [];
-  console.log('[BARGE_IN] audio queue cleared');
+  console.log('[AUDIO_QUEUE] cleared due to barge-in');
 
-  // Cancel Grok
+  // Cancel Grok response
   if (st.grokRespActive && st.grok?.readyState === WebSocket.OPEN) {
     st.grok.send(JSON.stringify({ type: 'response.cancel' }));
     st.grokRespActive = false;
     console.log('[GROK] response cancelled due to barge-in');
   }
 
-  st.gen++;
-  console.log('[BARGE_IN] gen incremented to', st.gen);
+  // Mark this generation as cancelled
+  st.playbackGen++;
+  console.log('[BARGE_IN] gen incremented to', st.playbackGen);
 
   if (st.silenceTimer) { clearTimeout(st.silenceTimer); st.silenceTimer = null; }
 }
 
-// ─── LOCAL VAD ───────────────────────────────────────────────────────────────
+// ─── LOCAL VAD ────────────────────────────────────────────────────────────
 
 function checkLocalVad(st, ulawPayload) {
-  if (!VAD_ENABLED || st.grokRespActive === false) return; // only when AI is responding
+  if (!VAD_ENABLED) return;
+  if (st.echoGuardUntil > Date.now()) {
+    console.log('[BARGE_IN] echo guard active, ignoring local VAD');
+    st.vadFrameCount = 0;
+    return;
+  }
+  if (!st.aiSpeaking && st.queue.length === 0) {
+    st.vadFrameCount = 0;
+    return;
+  }
+  if (st.suppressAiAudio) {
+    st.vadFrameCount = 0;
+    return;
+  }
 
   const rms = calcRms(ulawPayload);
-  st.lastRms = rms;
-
-  if (rms > RMS_THRESH) {
+  st.lastRms = Math.round(rms);
+  if (rms >= RMS_THRESH) {
     st.vadFrameCount++;
-    console.log('[LOCAL_VAD] rms:', Math.round(rms), 'frames:', st.vadFrameCount, '/', MIN_FRAMES);
-    if (st.vadFrameCount >= MIN_FRAMES && !st.userSpeaking && st.aiSpeaking) {
-      console.log('[BARGE_IN_LOCAL] user speech detected');
+    console.log('[LOCAL_VAD] rms:', st.lastRms, 'threshold:', RMS_THRESH, 'frames:', st.vadFrameCount, '/', MIN_FRAMES);
+    if (st.vadFrameCount >= MIN_FRAMES && !st.userSpeaking) {
       st.vadFrameCount = 0;
       doBargeIn(st);
     }
@@ -188,18 +202,16 @@ function checkLocalVad(st, ulawPayload) {
   }
 }
 
-// ─── SILENCE TIMER (only after audio drained) ─────────────────────────────────
+// ─── SILENCE TIMER ────────────────────────────────────────────────────────
 
 function startSilenceTimer(st) {
   if (st.silenceTimer) clearTimeout(st.silenceTimer);
-  // Don't start if user is speaking or AI is responding
-  if (st.userSpeaking || st.grokRespActive || st.queue.length > 0 || st.aiSpeaking) {
-    return;
-  }
+  // Only start when: no AI speaking, queue empty, client not speaking, call active
+  if (st.aiSpeaking || st.queue.length > 0 || st.userSpeaking || !st.callActive) return;
 
-  console.log('[SILENCE] timer started after audio drained');
+  console.log('[SILENCE] timer started (ai done, queue empty, client quiet)');
   st.silenceTimer = setTimeout(() => {
-    if (!st.callActive || st.userSpeaking || st.grokRespActive) return;
+    if (!st.callActive || st.userSpeaking || st.aiSpeaking || st.queue.length > 0) return;
     st.silenceAttempts++;
     console.log('[SILENCE] timeout, attempt', st.silenceAttempts);
 
@@ -211,27 +223,27 @@ function startSilenceTimer(st) {
     } else {
       console.log('[SILENCE] max attempts, ending politely');
       if (st.grok?.readyState === WebSocket.OPEN) {
-        st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Encerrar. Diga: "Tudo bem, bom dia!"' }] } }));
+        st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Encerrar. Diga apenas: "Tudo bem, bom dia!"' }] } }));
         st.grok.send(JSON.stringify({ type: 'response.create' }));
       }
     }
   }, SILENCE_TIMEOUT);
 }
 
-// ─── AUDIO SENDER ─────────────────────────────────────────────────────────────
+// ─── AUDIO SENDER ───────────────────────────────────────────────────────
 
 async function sendQueue(st) {
   if (st.sending || st.queue.length === 0 || st.userSpeaking) return;
   st.sending = true;
-  const gen = st.gen;
+  const gen = st.playbackGen;
 
   // Prebuffer
   st.preCount = 0;
-  while (st.preCount < PREBUFFER && st.queue.length > 0 && !st.userSpeaking && st.gen === gen) {
+  while (st.preCount < PREBUFFER && st.queue.length > 0 && !st.userSpeaking && st.playbackGen === gen) {
     await sleep(20);
     st.preCount++;
   }
-  if (st.userSpeaking || st.gen !== gen) {
+  if (st.userSpeaking || st.playbackGen !== gen) {
     st.sending = false;
     console.log('[AUDIO] aborted prebuffer');
     return;
@@ -240,8 +252,8 @@ async function sendQueue(st) {
   console.log('[AUDIO] prebuffer done, sending', st.queue.length, 'chunks');
 
   while (st.queue.length > 0) {
-    if (!st.callActive || st.userSpeaking || st.gen !== gen) {
-      console.log('[AUDIO_QUEUE] stopped due to barge-in or call end');
+    if (!st.callActive || st.userSpeaking || st.playbackGen !== gen) {
+      console.log('[AUDIO_QUEUE] stopped due to', !st.callActive ? 'call end' : 'barge-in');
       break;
     }
     const chunk = st.queue.shift();
@@ -254,11 +266,12 @@ async function sendQueue(st) {
   st.sending = false;
   console.log('[AUDIO] done sending');
 
-  // Only start silence timer after audio fully drained
-  startSilenceTimer(st);
+  if (st.queue.length === 0 && !st.userSpeaking && !st.aiSpeaking) {
+    startSilenceTimer(st);
+  }
 }
 
-// ─── TWILIO WEBHOOKS ─────────────────────────────────────────────────────────
+// ─── TWILIO WEBHOOKS ────────────────────────────────────────────────────
 
 app.post('/voice', (req, res) => {
   console.log('[TWILIO]', req.body?.CallSid);
@@ -269,7 +282,7 @@ app.post('/voice-say', (_, res) => {
   res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say language="pt-BR" voice="alice">Teste.</Say></Response>`);
 });
 
-// ─── WEBSOCKET ───────────────────────────────────────────────────────────────
+// ─── WEBSOCKET ─────────────────────────────────────────────────────────
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
@@ -286,11 +299,11 @@ wss.on('connection', (ws, req) => {
         connectGrok(st);
 
       } else if (d.event === 'media' && st) {
-        // Pass inbound audio to Grok
+        // To Grok
         if (d.media?.payload && st.grok?.readyState === WebSocket.OPEN && st.grokReady) {
           st.grok.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: d.media.payload }));
         }
-        // Local VAD on Twilio inbound
+        // Local VAD
         if (VAD_ENABLED && d.media?.payload) {
           const ulawBytes = Buffer.from(d.media.payload, 'base64');
           checkLocalVad(st, ulawBytes);
@@ -299,13 +312,10 @@ wss.on('connection', (ws, req) => {
       } else if (d.event === 'stop' && st) {
         console.log('[WS] stop');
         st.callActive = false;
-        st.userSpeaking = false;
         st.queue = [];
+        st.userSpeaking = false;
         if (st.silenceTimer) clearTimeout(st.silenceTimer);
         if (st.grok) { st.grok.close(); st.grok = null; }
-
-      } else if (d.event === 'mark' && st) {
-        console.log('[WS] mark:', d.mark?.name);
       }
     } catch (e) { console.error('[WS]', e.message); }
   });
@@ -316,7 +326,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ─── GROK ────────────────────────────────────────────────────────────────────
+// ─── GROK ────────────────────────────────────────────────────────────────
 
 function connectGrok(st) {
   st.grok = new WebSocket(
@@ -327,16 +337,11 @@ function connectGrok(st) {
   st.grok.on('open', () => {
     console.log('[GROK] connected');
 
-    const persona = `Você é a assistente virtual da Família do Gás, delivery de gás em Campo Grande, MS. Ligando para clientes inativos há mais de 15 dias.
+    const persona = `Você é a assistente virtual da Família do Gás, delivery de gás em Campo Grande, MS. Liga para clientes inativos há mais de 15 dias.
 
-FALE CURTO. Uma frase por vez. Menos de 10 palavras. Aguarde o cliente responder.
+FALE UMA FRASE. Aguarde resposta. Não emende frases extras.
 
 ABERTURA: "Olá, aqui é da Família do Gás. Está precisando de gás hoje?"
-
-Se "sim": "Para o endereço habitual, né?"
-Se "não" ou "não preciso": "Tudo bem. Quer que te lembre outro dia?"
-
-ENCERRAMENTO: "WhatsApp: 67 9361-8055. Bom dia!"
 
 register_result(intent, notes) — intent: venda | interesse | agendar | sem_interesse | sem_resposta`;
 
@@ -353,7 +358,7 @@ register_result(intent, notes) — intent: venda | interesse | agendar | sem_int
       }
     }));
 
-    st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Ligue para o cliente.' }] } }));
+    st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Ligue.' }] } }));
     st.grok.send(JSON.stringify({ type: 'response.create' }));
     console.log('[GROK] greeting sent');
   });
@@ -367,15 +372,24 @@ register_result(intent, notes) — intent: venda | interesse | agendar | sem_int
         st.grokReady = true;
 
       } else if (t === 'response.output_audio.delta') {
+        // Discard if suppressed (cancelled response)
+        if (st.suppressAiAudio) {
+          console.log('[AUDIO] discarded stale/cancelled audio delta');
+          return;
+        }
         if (!e.delta || !st.callActive) return;
+
         st.aiSpeaking = true;
         st.grokRespActive = true;
         st.userSpeaking = false;
-        st.vadFrameCount = 0; // reset VAD
+        st.vadFrameCount = 0;
+
+        // Enable echo guard — suppress local VAD while AI speaks
+        st.echoGuardUntil = Date.now() + ECHO_GUARD;
 
         const chunks = toChunks(e.delta);
         st.queue.push(...chunks);
-        console.log('[AUDIO] queued', chunks.length, '| queue:', st.queue.length);
+        console.log('[AUDIO] queued', chunks.length, '| queue:', st.queue.length, '| gen:', st.playbackGen);
 
         if (st.queue.length > MAX_QUEUE) {
           console.log('[AUDIO] WARNING queue at', st.queue.length);
@@ -390,21 +404,19 @@ register_result(intent, notes) — intent: venda | interesse | agendar | sem_int
         st.grokRespActive = false;
         st.aiSpeaking = false;
         console.log('[GROK] response done');
-        // Silence timer started by sendQueue when sending finishes
+        startSilenceTimer(st);
 
       } else if (t === 'input_audio_buffer.speech_started') {
-        // Grok's own VAD — client is speaking
-        console.log('[GROK_VAD] client speech detected');
-        // Cancel Grok response if active
+        console.log('[GROK_VAD] client speech started');
         if (st.grokRespActive && st.grok?.readyState === WebSocket.OPEN) {
           st.grok.send(JSON.stringify({ type: 'response.cancel' }));
           st.grokRespActive = false;
-          console.log('[GROK] response cancelled due to client VAD');
+          console.log('[GROK] response cancelled by client VAD');
         }
         doBargeIn(st);
 
       } else if (t === 'input_audio_buffer.speech_stopped') {
-        console.log('[BARGE_IN] user stopped speaking');
+        console.log('[BARGE_IN] client stopped speaking');
         st.userSpeaking = false;
         st.silenceAttempts = 0;
 
@@ -434,7 +446,7 @@ server.on('upgrade', (req, socket, head) => {
   else socket.destroy();
 });
 
-// ─── OUTBOUND + N8N + HEALTH ──────────────────────────────────────────────────
+// ─── OUTBOUND + N8N + HEALTH ─────────────────────────────────────────────
 
 app.post('/call', async (req, res) => {
   const { to } = req.body;
@@ -469,9 +481,9 @@ async function sendResult(callSid, phone, name, intent, notes) {
   } catch (e) { console.error('[N8N]', e.message); }
 }
 
-app.get('/health', (_, r) => r.json({ status: 'ok', v: '2.9', gain, maxQueue: MAX_QUEUE, localVad: VAD_ENABLED }));
-app.get('/', (_, r) => r.json({ name: 'Twilio + Grok', v: '2.9' }));
+app.get('/health', (_, r) => r.json({ status: 'ok', v: '2.10', gain, maxQueue: MAX_QUEUE, localVad: VAD_ENABLED, rmsThresh: RMS_THRESH, echoGuard: ECHO_GUARD }));
+app.get('/', (_, r) => r.json({ name: 'Twilio + Grok', v: '2.10' }));
 
-server.listen(PORT, () => console.log(`\n🚀 v2.9 | local VAD:${VAD_ENABLED} | rms:${RMS_THRESH} | queue:${MAX_QUEUE}`));
+server.listen(PORT, () => console.log(`\n🚀 v2.10 | rms:${RMS_THRESH} echoGuard:${ECHO_GUARD}ms | queue:${MAX_QUEUE}`));
 
 module.exports = { app, server };
