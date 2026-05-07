@@ -1,6 +1,6 @@
 /**
- * Twilio + Grok Voice Bridge v2.10
- * Fix: higher RMS threshold, echo guard, suppress stale deltas, correct silence timer
+ * Twilio + Grok Voice Bridge v2.11
+ * Strict turn-taking: one phrase, wait for client. Echo guard short. State machine.
  */
 
 require('dotenv').config();
@@ -22,7 +22,7 @@ const {
   LOCAL_VAD_ENABLED = 'true',
   BARGE_IN_RMS_THRESHOLD = '180',
   BARGE_IN_MIN_FRAMES = '4',
-  BARGE_IN_ECHO_GUARD_MS = '500'
+  BARGE_IN_ECHO_GUARD_MS = '80'
 } = process.env;
 
 const sourceRate = parseInt(AUDIO_SOURCE_RATE) || 24000;
@@ -34,7 +34,7 @@ const SILENCE_TIMEOUT = 5000;
 const VAD_ENABLED = LOCAL_VAD_ENABLED === 'true';
 const RMS_THRESH = parseInt(BARGE_IN_RMS_THRESHOLD) || 180;
 const MIN_FRAMES = parseInt(BARGE_IN_MIN_FRAMES) || 4;
-const ECHO_GUARD = parseInt(BARGE_IN_ECHO_GUARD_MS) || 500;
+const ECHO_GUARD = parseInt(BARGE_IN_ECHO_GUARD_MS) || 80;
 
 console.log(`[CONFIG] rate:${sourceRate} gain:${gain} maxQ:${MAX_QUEUE}`);
 console.log(`[LOCAL_VAD] enabled:${VAD_ENABLED} rms:${RMS_THRESH} minFrames:${MIN_FRAMES} echoGuard:${ECHO_GUARD}ms`);
@@ -43,7 +43,7 @@ console.log(`[LOCAL_VAD] enabled:${VAD_ENABLED} rms:${RMS_THRESH} minFrames:${MI
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── μ-law decode (for VAD) ─────────────────────────────────────────────────
+// ─── μ-law decode ───────────────────────────────────────────────────────────
 
 function ulawToPcm16(byte) {
   byte = ~byte;
@@ -57,14 +57,11 @@ function ulawToPcm16(byte) {
 
 function calcRms(ulawBuf) {
   let sum = 0;
-  for (let i = 0; i < ulawBuf.length; i++) {
-    const s = ulawToPcm16(ulawBuf[i]);
-    sum += s * s;
-  }
+  for (let i = 0; i < ulawBuf.length; i++) { const s = ulawToPcm16(ulawBuf[i]); sum += s * s; }
   return Math.sqrt(sum / ulawBuf.length);
 }
 
-// ─── G.711 μ-law encode ─────────────────────────────────────────────────────
+// ─── G.711 μ-law encode ───────────────────────────────────────────────────
 
 const BIAS = 0x84, CLIP = 32635;
 function toUlaw(s) {
@@ -85,7 +82,7 @@ function pcmToUlaw(buf) {
   return out;
 }
 
-// ─── 3-sample avg downsample ────────────────────────────────────────────────
+// ─── 3-sample avg downsample ──────────────────────────────────────────────
 
 function downsample(samples, factor) {
   const out = new Int16Array(Math.floor(samples.length / factor));
@@ -97,7 +94,7 @@ function downsample(samples, factor) {
   return out;
 }
 
-// ─── AUDIO CONVERTER ────────────────────────────────────────────────────────
+// ─── AUDIO CONVERTER ──────────────────────────────────────────────────────
 
 function toChunks(base64) {
   const raw = Buffer.from(base64, 'base64');
@@ -113,7 +110,17 @@ function toChunks(base64) {
   return chunks;
 }
 
-// ─── CALL STATE ────────────────────────────────────────────────────────────
+// ─── TURN STATES ─────────────────────────────────────────────────────────
+
+const TURN = {
+  IDLE: 'idle',
+  ASSISTANT_SPEAKING: 'assistant_speaking',
+  WAITING_FOR_USER: 'waiting_for_user',
+  USER_SPEAKING: 'user_speaking',
+  GENERATING_RESPONSE: 'generating_response'
+};
+
+// ─── CALL STATE ──────────────────────────────────────────────────────────
 
 function makeState(ws, sid, callSid, phone, name) {
   return {
@@ -124,30 +131,34 @@ function makeState(ws, sid, callSid, phone, name) {
     grok: null,
     grokReady: false,
     callActive: true,
+    turn: TURN.IDLE,
     userSpeaking: false,
-    aiSpeaking: false,
-    suppressAiAudio: false,
+    suppressAudio: false,
     playbackGen: 0,
-    responseGen: 0,
     grokRespActive: false,
     silenceTimer: null,
     silenceAttempts: 0,
-    // Local VAD
+    echoGuardUntil: 0,
     vadFrameCount: 0,
-    echoGuardUntil: 0, // timestamp until which VAD is suppressed
-    lastRms: 0
+    lastRms: 0,
+    openingDone: false
   };
 }
 
-// ─── BARGE-IN ──────────────────────────────────────────────────────────────
+// ─── TURN LOG ───────────────────────────────────────────────────────────
+
+function turn(st, next) {
+  st.turn = next;
+  console.log('[TURN]', next);
+}
+
+// ─── BARGE-IN ───────────────────────────────────────────────────────────
 
 function doBargeIn(st) {
   console.log('[BARGE_IN] user started speaking');
   st.userSpeaking = true;
-  st.aiSpeaking = false;
-  st.suppressAiAudio = true;
+  st.suppressAudio = true;
 
-  // Clear Twilio
   if (st.ws?.readyState === WebSocket.OPEN && st.sid) {
     st.ws.send(JSON.stringify({ event: 'clear', streamSid: st.sid }));
     console.log('[BARGE_IN] Twilio clear sent');
@@ -156,43 +167,38 @@ function doBargeIn(st) {
   st.queue = [];
   console.log('[AUDIO_QUEUE] cleared due to barge-in');
 
-  // Cancel Grok response
   if (st.grokRespActive && st.grok?.readyState === WebSocket.OPEN) {
     st.grok.send(JSON.stringify({ type: 'response.cancel' }));
     st.grokRespActive = false;
     console.log('[GROK] response cancelled due to barge-in');
   }
 
-  // Mark this generation as cancelled
   st.playbackGen++;
-  console.log('[BARGE_IN] gen incremented to', st.playbackGen);
+  turn(st, TURN.USER_SPEAKING);
 
   if (st.silenceTimer) { clearTimeout(st.silenceTimer); st.silenceTimer = null; }
 }
 
-// ─── LOCAL VAD ────────────────────────────────────────────────────────────
+// ─── LOCAL VAD ─────────────────────────────────────────────────────────
 
 function checkLocalVad(st, ulawPayload) {
   if (!VAD_ENABLED) return;
   if (st.echoGuardUntil > Date.now()) {
-    console.log('[BARGE_IN] echo guard active, ignoring local VAD');
     st.vadFrameCount = 0;
     return;
   }
-  if (!st.aiSpeaking && st.queue.length === 0) {
+  // Only detect while AI is speaking or waiting
+  if (st.turn !== TURN.ASSISTANT_SPEAKING && st.turn !== TURN.WAITING_FOR_USER && st.turn !== TURN.GENERATING_RESPONSE) {
     st.vadFrameCount = 0;
     return;
   }
-  if (st.suppressAiAudio) {
-    st.vadFrameCount = 0;
-    return;
-  }
+  if (st.suppressAudio) { st.vadFrameCount = 0; return; }
 
   const rms = calcRms(ulawPayload);
   st.lastRms = Math.round(rms);
   if (rms >= RMS_THRESH) {
     st.vadFrameCount++;
-    console.log('[LOCAL_VAD] rms:', st.lastRms, 'threshold:', RMS_THRESH, 'frames:', st.vadFrameCount, '/', MIN_FRAMES);
+    console.log('[LOCAL_VAD] rms:', st.lastRms, 'thresh:', RMS_THRESH, 'frames:', st.vadFrameCount, '/', MIN_FRAMES);
     if (st.vadFrameCount >= MIN_FRAMES && !st.userSpeaking) {
       st.vadFrameCount = 0;
       doBargeIn(st);
@@ -202,42 +208,33 @@ function checkLocalVad(st, ulawPayload) {
   }
 }
 
-// ─── SILENCE TIMER ────────────────────────────────────────────────────────
+// ─── SILENCE TIMER ────────────────────────────────────────────────────
 
 function startSilenceTimer(st) {
   if (st.silenceTimer) clearTimeout(st.silenceTimer);
-  // Only start when: no AI speaking, queue empty, client not speaking, call active
-  if (st.aiSpeaking || st.queue.length > 0 || st.userSpeaking || !st.callActive) return;
-
-  console.log('[SILENCE] timer started (ai done, queue empty, client quiet)');
-  st.silenceTimer = setTimeout(() => {
-    if (!st.callActive || st.userSpeaking || st.aiSpeaking || st.queue.length > 0) return;
-    st.silenceAttempts++;
-    console.log('[SILENCE] timeout, attempt', st.silenceAttempts);
-
-    if (st.silenceAttempts <= 1) {
-      if (st.grok?.readyState === WebSocket.OPEN) {
-        st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Cliente não respondeu. Diga: "Alô, consegue me ouvir?"' }] } }));
+  if (st.turn !== TURN.WAITING_FOR_USER) return;
+  if (st.callActive) {
+    console.log('[SILENCE] timer started');
+    st.silenceTimer = setTimeout(() => {
+      if (!st.callActive || st.turn !== TURN.WAITING_FOR_USER) return;
+      st.silenceAttempts++;
+      console.log('[SILENCE] timeout, attempt', st.silenceAttempts);
+      if (st.silenceAttempts <= 1 && st.grok?.readyState === WebSocket.OPEN) {
+        st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Cliente não respondeu. Diga apenas: "Alô, consegue me ouvir?"' }] } }));
         st.grok.send(JSON.stringify({ type: 'response.create' }));
+        turn(st, TURN.GENERATING_RESPONSE);
       }
-    } else {
-      console.log('[SILENCE] max attempts, ending politely');
-      if (st.grok?.readyState === WebSocket.OPEN) {
-        st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Encerrar. Diga apenas: "Tudo bem, bom dia!"' }] } }));
-        st.grok.send(JSON.stringify({ type: 'response.create' }));
-      }
-    }
-  }, SILENCE_TIMEOUT);
+    }, SILENCE_TIMEOUT);
+  }
 }
 
-// ─── AUDIO SENDER ───────────────────────────────────────────────────────
+// ─── AUDIO SENDER ─────────────────────────────────────────────────────
 
 async function sendQueue(st) {
   if (st.sending || st.queue.length === 0 || st.userSpeaking) return;
   st.sending = true;
   const gen = st.playbackGen;
 
-  // Prebuffer
   st.preCount = 0;
   while (st.preCount < PREBUFFER && st.queue.length > 0 && !st.userSpeaking && st.playbackGen === gen) {
     await sleep(20);
@@ -245,15 +242,12 @@ async function sendQueue(st) {
   }
   if (st.userSpeaking || st.playbackGen !== gen) {
     st.sending = false;
-    console.log('[AUDIO] aborted prebuffer');
     return;
   }
 
-  console.log('[AUDIO] prebuffer done, sending', st.queue.length, 'chunks');
-
   while (st.queue.length > 0) {
     if (!st.callActive || st.userSpeaking || st.playbackGen !== gen) {
-      console.log('[AUDIO_QUEUE] stopped due to', !st.callActive ? 'call end' : 'barge-in');
+      console.log('[AUDIO_QUEUE] stopped');
       break;
     }
     const chunk = st.queue.shift();
@@ -266,12 +260,14 @@ async function sendQueue(st) {
   st.sending = false;
   console.log('[AUDIO] done sending');
 
-  if (st.queue.length === 0 && !st.userSpeaking && !st.aiSpeaking) {
+  // When AI finishes and client hasn't spoken
+  if (st.turn === TURN.ASSISTANT_SPEAKING && !st.userSpeaking && st.callActive) {
+    turn(st, TURN.WAITING_FOR_USER);
     startSilenceTimer(st);
   }
 }
 
-// ─── TWILIO WEBHOOKS ────────────────────────────────────────────────────
+// ─── TWILIO WEBHOOKS ──────────────────────────────────────────────────
 
 app.post('/voice', (req, res) => {
   console.log('[TWILIO]', req.body?.CallSid);
@@ -299,21 +295,17 @@ wss.on('connection', (ws, req) => {
         connectGrok(st);
 
       } else if (d.event === 'media' && st) {
-        // To Grok
         if (d.media?.payload && st.grok?.readyState === WebSocket.OPEN && st.grokReady) {
           st.grok.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: d.media.payload }));
         }
-        // Local VAD
         if (VAD_ENABLED && d.media?.payload) {
-          const ulawBytes = Buffer.from(d.media.payload, 'base64');
-          checkLocalVad(st, ulawBytes);
+          checkLocalVad(st, Buffer.from(d.media.payload, 'base64'));
         }
 
       } else if (d.event === 'stop' && st) {
         console.log('[WS] stop');
         st.callActive = false;
         st.queue = [];
-        st.userSpeaking = false;
         if (st.silenceTimer) clearTimeout(st.silenceTimer);
         if (st.grok) { st.grok.close(); st.grok = null; }
       }
@@ -326,7 +318,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ─── GROK ────────────────────────────────────────────────────────────────
+// ─── GROK ──────────────────────────────────────────────────────────────
 
 function connectGrok(st) {
   st.grok = new WebSocket(
@@ -337,19 +329,25 @@ function connectGrok(st) {
   st.grok.on('open', () => {
     console.log('[GROK] connected');
 
-    const persona = `Você é a assistente virtual da Família do Gás, delivery de gás em Campo Grande, MS. Liga para clientes inativos há mais de 15 dias.
-
-FALE UMA FRASE. Aguarde resposta. Não emende frases extras.
-
-ABERTURA: "Olá, aqui é da Família do Gás. Está precisando de gás hoje?"
-
-register_result(intent, notes) — intent: venda | interesse | agendar | sem_interesse | sem_resposta`;
-
     st.grok.send(JSON.stringify({
       type: 'session.update',
       session: {
         voice: 'Sal',
-        instructions: persona,
+        instructions: `Você é atendente da Família do Gás, delivery de gás em Campo Grande, MS.
+
+FALE CURTO. Uma pergunta por vez.
+Nunca fale duas perguntas seguidas.
+Depois de perguntar, pare e aguarde.
+Não diga "posso te ajudar".
+Não diga "me avisa se precisar".
+
+ROTEIRO:
+- Abertura: "Olá, aqui é da Família do Gás. Está precisando de gás hoje?"
+- Se "sim": "Perfeito. É para o endereço habitual?"
+- Se "não": "Tudo bem. Bom dia!"
+- Se silêncio 4s: "Alô, consegue me ouvir?" (só uma vez)
+
+register_result(intent, notes) — intent: venda | interesse | agendar | sem_interesse | sem_resposta`,
         turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 500, prefix_padding_ms: 200 },
         tools: [{ type: 'function', name: 'register_result', description: 'registra',
           parameters: { type: 'object', properties: { intent: { type: 'string', enum: ['venda','interesse','agendar','sem_interesse','sem_resposta'] }, notes: { type: 'string' } }, required: ['intent'] } }],
@@ -358,9 +356,14 @@ register_result(intent, notes) — intent: venda | interesse | agendar | sem_int
       }
     }));
 
-    st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Ligue.' }] } }));
+    // Send controlled opening text — ONE phrase only
+    st.grok.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Diga ao cliente: "Olá, aqui é da Família do Gás. Está precisando de gás hoje?"' }] }
+    }));
     st.grok.send(JSON.stringify({ type: 'response.create' }));
-    console.log('[GROK] greeting sent');
+    console.log('[GROK] opening sent, waiting...');
+    turn(st, TURN.ASSISTANT_SPEAKING);
   });
 
   st.grok.on('message', msg => {
@@ -372,29 +375,28 @@ register_result(intent, notes) — intent: venda | interesse | agendar | sem_int
         st.grokReady = true;
 
       } else if (t === 'response.output_audio.delta') {
-        // Discard if suppressed (cancelled response)
-        if (st.suppressAiAudio) {
-          console.log('[AUDIO] discarded stale/cancelled audio delta');
+        if (st.suppressAudio) {
+          console.log('[AUDIO] discarded stale delta');
           return;
         }
         if (!e.delta || !st.callActive) return;
 
-        st.aiSpeaking = true;
-        st.grokRespActive = true;
-        st.userSpeaking = false;
-        st.vadFrameCount = 0;
+        // Activate echo guard only at start of AI speech
+        if (st.turn === TURN.ASSISTANT_SPEAKING && !st.echoGuardUntil) {
+          st.echoGuardUntil = Date.now() + ECHO_GUARD;
+          console.log('[BARGE_IN] echo guard active for', ECHO_GUARD, 'ms');
+        }
+        // Check if echo guard expired
+        if (st.echoGuardUntil && Date.now() > st.echoGuardUntil) {
+          console.log('[BARGE_IN] echo guard expired, local VAD enabled');
+          st.echoGuardUntil = 0;
+        }
 
-        // Enable echo guard — suppress local VAD while AI speaks
-        st.echoGuardUntil = Date.now() + ECHO_GUARD;
+        st.grokRespActive = true;
 
         const chunks = toChunks(e.delta);
         st.queue.push(...chunks);
-        console.log('[AUDIO] queued', chunks.length, '| queue:', st.queue.length, '| gen:', st.playbackGen);
-
-        if (st.queue.length > MAX_QUEUE) {
-          console.log('[AUDIO] WARNING queue at', st.queue.length);
-        }
-
+        console.log('[AUDIO] queued', chunks.length, '| queue:', st.queue.length);
         sendQueue(st);
 
       } else if (t === 'response.output_audio_transcript.delta') {
@@ -402,9 +404,14 @@ register_result(intent, notes) — intent: venda | interesse | agendar | sem_int
 
       } else if (t === 'response.done') {
         st.grokRespActive = false;
-        st.aiSpeaking = false;
         console.log('[GROK] response done');
-        startSilenceTimer(st);
+        // Only transition to waiting if AI was speaking
+        if (st.turn === TURN.ASSISTANT_SPEAKING || st.turn === TURN.GENERATING_RESPONSE) {
+          if (!st.userSpeaking) {
+            turn(st, TURN.WAITING_FOR_USER);
+            startSilenceTimer(st);
+          }
+        }
 
       } else if (t === 'input_audio_buffer.speech_started') {
         console.log('[GROK_VAD] client speech started');
@@ -416,20 +423,30 @@ register_result(intent, notes) — intent: venda | interesse | agendar | sem_int
         doBargeIn(st);
 
       } else if (t === 'input_audio_buffer.speech_stopped') {
-        console.log('[BARGE_IN] client stopped speaking');
+        console.log('[BARGE_IN] user stopped');
         st.userSpeaking = false;
         st.silenceAttempts = 0;
+        // Transition to generating after user stops
+        if (st.turn === TURN.USER_SPEAKING) {
+          turn(st, TURN.GENERATING_RESPONSE);
+          // Grok will respond naturally to client input
+        }
 
       } else if (t === 'response.function_call_arguments.done') {
         const args = JSON.parse(e.arguments || '{}');
         console.log('[TOOL]', e.name, args);
         if (e.name === 'register_result') sendResult(st.callSid, st.phone, st.customerName, args.intent, args.notes || '');
         st.grok.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: e.call_id, output: JSON.stringify({ success: true }) } }));
-        st.grok.send(JSON.stringify({ type: 'response.create' }));
+        // Do NOT send response.create here — we wait for client
 
       } else if (t === 'conversation.item.input_audio_transcription.completed') {
         console.log('[GROK] client said:', e.transcript);
         st.userSpeaking = false;
+        turn(st, TURN.GENERATING_RESPONSE);
+        // Grok should respond naturally — but we need to trigger it
+        if (st.grok?.readyState === WebSocket.OPEN) {
+          st.grok.send(JSON.stringify({ type: 'response.create' }));
+        }
 
       } else if (t === 'error') {
         console.error('[GROK]', e.error?.message);
@@ -446,7 +463,7 @@ server.on('upgrade', (req, socket, head) => {
   else socket.destroy();
 });
 
-// ─── OUTBOUND + N8N + HEALTH ─────────────────────────────────────────────
+// ─── OUTBOUND + N8N + HEALTH ───────────────────────────────────────────
 
 app.post('/call', async (req, res) => {
   const { to } = req.body;
@@ -481,9 +498,9 @@ async function sendResult(callSid, phone, name, intent, notes) {
   } catch (e) { console.error('[N8N]', e.message); }
 }
 
-app.get('/health', (_, r) => r.json({ status: 'ok', v: '2.10', gain, maxQueue: MAX_QUEUE, localVad: VAD_ENABLED, rmsThresh: RMS_THRESH, echoGuard: ECHO_GUARD }));
-app.get('/', (_, r) => r.json({ name: 'Twilio + Grok', v: '2.10' }));
+app.get('/health', (_, r) => r.json({ status: 'ok', v: '2.11', turn: true }));
+app.get('/', (_, r) => r.json({ name: 'Twilio + Grok', v: '2.11' }));
 
-server.listen(PORT, () => console.log(`\n🚀 v2.10 | rms:${RMS_THRESH} echoGuard:${ECHO_GUARD}ms | queue:${MAX_QUEUE}`));
+server.listen(PORT, () => console.log(`\n🚀 v2.11 | turn-taking | echoGuard:${ECHO_GUARD}ms | rms:${RMS_THRESH}`));
 
 module.exports = { app, server };
